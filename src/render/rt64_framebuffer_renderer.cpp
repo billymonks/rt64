@@ -584,7 +584,7 @@ namespace RT64 {
 
     static bool buildDirectionalShadow(const DrawData &drawData, float nativeWidth, float nativeHeight, const std::vector<ShadowFitRange> &ranges, const float localDirection[3], interop::float4x4 &lightMatrix, interop::float3 &lightDirection, interop::float3 &worldUp) {
         struct Point {
-            float x, y, z;
+            float x, y, z, w;
         };
         struct Bucket {
             int quantized[9] = {};
@@ -610,6 +610,7 @@ namespace RT64 {
                 if (!scenePosition(drawData, vertex, point.x, point.y, point.z, transform)) {
                     continue;
                 }
+                point.w = (vertex < drawData.posTransformed.size()) ? std::max(float(drawData.posTransformed[vertex][3]), 0.0f) : 0.0f;
 
                 const int quantized[9] = {
                     quantizeRotation(transform->m[0][0]), quantizeRotation(transform->m[1][0]), quantizeRotation(transform->m[2][0]),
@@ -683,33 +684,36 @@ namespace RT64 {
         dirY /= dirLength;
         dirZ /= dirLength;
 
-        float centerX = 0.0f;
-        float centerY = 0.0f;
-        float centerZ = 0.0f;
-        for (const Point &point : visible) {
-            centerX += point.x;
-            centerY += point.y;
-            centerZ += point.z;
-        }
-        const float invCount = 1.0f / float(visible.size());
-        centerX *= invCount;
-        centerY *= invCount;
-        centerZ *= invCount;
-
+        // Fit to everything up to a distance from the camera, so nearby geometry is never dropped because
+        // far away terrain pulls the fit elsewhere.
         distances.clear();
         distances.reserve(visible.size());
         for (const Point &point : visible) {
-            const float ox = point.x - centerX;
-            const float oy = point.y - centerY;
-            const float oz = point.z - centerZ;
-            distances.push_back(std::sqrt(ox * ox + oy * oy + oz * oz));
+            distances.push_back(point.w);
         }
         std::sort(distances.begin(), distances.end());
-        float keepDistance = distances[(distances.size() * 3) / 4];
-        if (keepDistance < 8.0f) {
-            keepDistance = 8.0f;
+        const float keepDistance = std::max(distances[distances.size() / 2] * 2.5f, 64.0f);
+
+        float centerX = 0.0f;
+        float centerY = 0.0f;
+        float centerZ = 0.0f;
+        uint32_t centerCount = 0;
+        for (const Point &point : visible) {
+            if (point.w > keepDistance) {
+                continue;
+            }
+            centerX += point.x;
+            centerY += point.y;
+            centerZ += point.z;
+            centerCount++;
         }
-        keepDistance *= 1.4f;
+        if (centerCount < 3) {
+            return false;
+        }
+        const float invCount = 1.0f / float(centerCount);
+        centerX *= invCount;
+        centerY *= invCount;
+        centerZ *= invCount;
 
         const float axisX = (std::fabs(dirY) > 0.85f) ? 1.0f : 0.0f;
         const float axisY = (std::fabs(dirY) > 0.85f) ? 0.0f : 1.0f;
@@ -739,7 +743,7 @@ namespace RT64 {
             const float ox = point.x - centerX;
             const float oy = point.y - centerY;
             const float oz = point.z - centerZ;
-            if (std::sqrt(ox * ox + oy * oy + oz * oz) > keepDistance) {
+            if (point.w > keepDistance) {
                 continue;
             }
             const float lightX = ox * rightX + oy * rightY + oz * rightZ;
@@ -1315,11 +1319,11 @@ namespace RT64 {
                     }
 
                     if (hidden) {
-                        // Outside the light's depth range, so depth clipping drops it.
+                        // Off the side of the shadow map. Depth is clamped rather than clipped, so it can't go there.
                         float *dst = &cutoutPositions[vertex * 4];
-                        dst[0] = 0.0f;
-                        dst[1] = 0.0f;
-                        dst[2] = -1.0f;
+                        dst[0] = 4.0f;
+                        dst[1] = 4.0f;
+                        dst[2] = 0.5f;
                         dst[3] = 1.0f;
                     }
                     else {
@@ -1392,9 +1396,9 @@ namespace RT64 {
             pipelineDesc.depthEnabled = true;
             pipelineDesc.depthWriteEnabled = true;
             pipelineDesc.depthFunction = RenderComparisonFunction::LESS;
-            pipelineDesc.depthBias = 2500;
-            pipelineDesc.slopeScaledDepthBias = 2.5f;
-            pipelineDesc.depthClipEnabled = true;
+            pipelineDesc.depthBias = 0;
+            pipelineDesc.slopeScaledDepthBias = 1.0f;
+            pipelineDesc.depthClipEnabled = false;
             pipelineDesc.depthTargetFormat = RenderFormat::D32_FLOAT;
             pipelineDesc.cullMode = RenderCullMode::NONE;
             pipelineDesc.inputSlots = vertexInputSlots.data();
@@ -1424,7 +1428,7 @@ namespace RT64 {
         ShadowApplyCB applyCB;
         applyCB.lightViewProj = lightMatrix;
         applyCB.resolutionShadow = interop::float4(rasterScene.nativeWidth, rasterScene.nativeHeight, float(ShadowMapSize), float(ShadowMapSize));
-        applyCB.lightDirectionBias = interop::float4(lightDirection.x, lightDirection.y, lightDirection.z, 0.0012f);
+        applyCB.lightDirectionBias = interop::float4(lightDirection.x, lightDirection.y, lightDirection.z, 0.0001f);
         applyCB.shadowTint = interop::float4(lightingSceneLight.shadowTint[0], lightingSceneLight.shadowTint[1], lightingSceneLight.shadowTint[2], lightingSceneLight.facingFloor);
 
         worker->commandList->barriers(RenderBarrierStage::GRAPHICS, RenderBufferBarrier(const_cast<RenderBuffer *>(lightingWorldPosBuffer), RenderBufferAccess::READ));

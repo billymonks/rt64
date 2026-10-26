@@ -84,5 +84,5 @@ float PSMain(in float4 vertexPosition : SV_POSITION, in float2 vertexUV : TEXCOO
     }
 
     const float slope = max(abs(ddx(vertexPosition.z)), abs(ddy(vertexPosition.z)));
-    return saturate(vertexPosition.z + slope * 1.5f + 0.0008f);
+    return saturate(vertexPosition.z + slope * 0.5f);
 }

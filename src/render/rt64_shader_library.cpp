@@ -663,9 +663,9 @@ namespace RT64 {
             pipelineDesc.depthEnabled = true;
             pipelineDesc.depthWriteEnabled = true;
             pipelineDesc.depthFunction = RenderComparisonFunction::LESS;
-            pipelineDesc.depthBias = 2500;
-            pipelineDesc.slopeScaledDepthBias = 2.5f;
-            pipelineDesc.depthClipEnabled = true;
+            pipelineDesc.depthBias = 0;
+            pipelineDesc.slopeScaledDepthBias = 1.0f;
+            pipelineDesc.depthClipEnabled = false;
             pipelineDesc.depthTargetFormat = RenderFormat::D32_FLOAT;
             pipelineDesc.cullMode = RenderCullMode::NONE;
             pipelineDesc.inputSlots = &inputSlot;
