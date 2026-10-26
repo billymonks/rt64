@@ -98,6 +98,7 @@ namespace RT64 {
         bool threePointFiltering;
         bool textureFiltering;
         bool smoothTransparency;
+        bool advancedLighting;
         RefreshRate refreshRate;
         int refreshRateTarget;
         InternalColorFormat internalColorFormat;

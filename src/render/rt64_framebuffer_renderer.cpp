@@ -16,6 +16,12 @@
 #include "rt64_descriptor_sets.h"
 #include "rt64_render_worker.h"
 
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <cfloat>
+#include <unordered_map>
+
 // TODO: Move to shared.
 
 namespace interop {
@@ -155,6 +161,676 @@ namespace RT64 {
 
     // RasterScene
 
+    static constexpr uint32_t ShadowMapSize = 2048;
+
+    static bool scenePosition(const DrawData &drawData, uint32_t vertex, float &x, float &y, float &z, const interop::float4x4 *&transform) {
+        if ((vertex * 3 + 2 >= drawData.posShorts.size()) || (vertex >= drawData.worldIndices.size())) {
+            return false;
+        }
+
+        const uint16_t worldIndex = drawData.worldIndices[vertex];
+        if (worldIndex >= drawData.worldTransforms.size()) {
+            return false;
+        }
+
+        transform = &drawData.worldTransforms[worldIndex];
+        const float px = float(drawData.posShorts[vertex * 3 + 0]);
+        const float py = float(drawData.posShorts[vertex * 3 + 1]);
+        const float pz = float(drawData.posShorts[vertex * 3 + 2]);
+        const interop::float4x4 &world = *transform;
+        x = px * world.m[0][0] + py * world.m[1][0] + pz * world.m[2][0] + world.m[3][0];
+        y = px * world.m[0][1] + py * world.m[1][1] + pz * world.m[2][1] + world.m[3][1];
+        z = px * world.m[0][2] + py * world.m[1][2] + pz * world.m[2][2] + world.m[3][2];
+        return true;
+    }
+
+    static int quantizeRotation(float value) {
+        return int(std::floor(value * 50.0f + (value >= 0.0f ? 0.5f : -0.5f)));
+    }
+
+    static bool isCameraFacing(const DrawData &drawData, uint32_t indexStart, uint32_t indexCount) {
+        if ((indexCount < 3) || (indexStart + indexCount > drawData.faceIndices.size())) {
+            return false;
+        }
+
+        // For a perspective camera, 1 / (1 - z) grows with the distance from the camera, so corners at the same
+        // distance have the same value.
+        for (uint32_t i = 0; i + 2 < indexCount; i += 3) {
+            float distance[3];
+            for (uint32_t k = 0; k < 3; k++) {
+                const uint32_t vertex = drawData.faceIndices[indexStart + i + k];
+                if (vertex >= drawData.posScreen.size()) {
+                    return false;
+                }
+                distance[k] = 1.0f / std::max(1.0f - float(drawData.posScreen[vertex][2]), 1e-7f);
+            }
+
+            const float nearest = std::min(distance[0], std::min(distance[1], distance[2]));
+            const float farthest = std::max(distance[0], std::max(distance[1], distance[2]));
+            if ((farthest - nearest) > (nearest * 0.003f)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    struct ShadowVec3 {
+        float x, y, z;
+
+        ShadowVec3 operator+(const ShadowVec3 &o) const { return { x + o.x, y + o.y, z + o.z }; }
+        ShadowVec3 operator-(const ShadowVec3 &o) const { return { x - o.x, y - o.y, z - o.z }; }
+        ShadowVec3 operator*(float s) const { return { x * s, y * s, z * s }; }
+        float dot(const ShadowVec3 &o) const { return x * o.x + y * o.y + z * o.z; }
+        ShadowVec3 cross(const ShadowVec3 &o) const { return { y * o.z - z * o.y, z * o.x - x * o.z, x * o.y - y * o.x }; }
+        float length() const { return std::sqrt(dot(*this)); }
+    };
+
+    struct ShadowVertex {
+        uint32_t index;
+        ShadowVec3 position;
+    };
+
+    struct ShadowFitRange {
+        uint32_t indexStart = 0;
+        uint32_t indexCount = 0;
+    };
+
+    struct ShadowCamera {
+        bool valid = false;
+        ShadowVec3 position = { 0.0f, 0.0f, 0.0f };
+        ShadowVec3 forward = { 0.0f, 0.0f, 1.0f };
+    };
+
+    // Finds the camera in the same space as scenePosition from the view projection used by most of the draws.
+    static ShadowCamera findShadowCamera(const DrawData &drawData, const std::vector<ShadowFitRange> &ranges) {
+        ShadowCamera camera;
+        thread_local std::vector<std::pair<uint16_t, uint32_t>> counts;
+        counts.clear();
+        uint32_t sampleVertex = UINT32_MAX;
+        for (const ShadowFitRange &range : ranges) {
+            for (uint32_t i = 0; i < range.indexCount; i += 7) {
+                const uint32_t vertex = drawData.faceIndices[range.indexStart + i];
+                if ((vertex >= drawData.viewProjIndices.size()) || (vertex >= drawData.posTransformed.size())) {
+                    continue;
+                }
+                const uint16_t viewProjIndex = drawData.viewProjIndices[vertex];
+                bool found = false;
+                for (auto &count : counts) {
+                    if (count.first == viewProjIndex) {
+                        count.second++;
+                        found = true;
+                    }
+                }
+                if (!found) {
+                    counts.emplace_back(viewProjIndex, 1);
+                }
+                if (sampleVertex == UINT32_MAX) {
+                    sampleVertex = vertex;
+                }
+            }
+        }
+        if (counts.empty()) {
+            return camera;
+        }
+
+        uint16_t viewProjIndex = counts[0].first;
+        uint32_t bestCount = 0;
+        for (const auto &count : counts) {
+            if (count.second > bestCount) {
+                viewProjIndex = count.first;
+                bestCount = count.second;
+            }
+        }
+        if (viewProjIndex >= drawData.viewProjTransforms.size()) {
+            return camera;
+        }
+
+        // Clip = [scene, 1] * viewProj. The camera sits where the clip x, y and w are all zero.
+        const interop::float4x4 &vp = drawData.viewProjTransforms[viewProjIndex];
+        const int rows[3] = { 0, 1, 3 };
+        float a[3][3], b[3];
+        for (int r = 0; r < 3; r++) {
+            for (int i = 0; i < 3; i++) {
+                a[r][i] = vp.m[i][rows[r]];
+            }
+            b[r] = -vp.m[3][rows[r]];
+        }
+        const float det = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+        if (std::fabs(det) < 1e-12f) {
+            return camera;
+        }
+        auto solve = [&](int column) {
+            float m[3][3];
+            for (int r = 0; r < 3; r++) {
+                for (int i = 0; i < 3; i++) {
+                    m[r][i] = (i == column) ? b[r] : a[r][i];
+                }
+            }
+            return (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])) / det;
+        };
+        camera.position = { solve(0), solve(1), solve(2) };
+        camera.forward = { vp.m[0][3], vp.m[1][3], vp.m[2][3] };
+        const float forwardLength = camera.forward.length();
+        if (forwardLength < 1e-8f) {
+            return camera;
+        }
+        camera.forward = camera.forward * (1.0f / forwardLength);
+
+        // Only trust it if it reproduces what the RSP computed for a real vertex.
+        const interop::float4x4 *transform = nullptr;
+        ShadowVec3 p;
+        if ((sampleVertex == UINT32_MAX) || !scenePosition(drawData, sampleVertex, p.x, p.y, p.z, transform)) {
+            return camera;
+        }
+        const float w = p.x * vp.m[0][3] + p.y * vp.m[1][3] + p.z * vp.m[2][3] + vp.m[3][3];
+        const float expectedW = drawData.posTransformed[sampleVertex][3];
+        camera.valid = std::fabs(w - expectedW) <= (std::fabs(expectedW) * 0.01f + 0.01f);
+        return camera;
+    }
+
+    // Splits a draw into pieces of triangles connected by shared vertices or shared positions, since a single
+    // draw can hold several separate sprites.
+    static void splitShadowComponents(const DrawData &drawData, uint32_t indexStart, uint32_t indexCount, std::vector<uint32_t> &triangleOrder, std::vector<uint32_t> &componentStarts) {
+        const uint32_t triangleCount = indexCount / 3;
+        thread_local std::vector<uint32_t> parent;
+        thread_local std::unordered_map<uint32_t, uint32_t> byVertex;
+        thread_local std::unordered_map<uint64_t, uint32_t> byPosition;
+        parent.resize(triangleCount);
+        byVertex.clear();
+        byPosition.clear();
+        for (uint32_t t = 0; t < triangleCount; t++) {
+            parent[t] = t;
+        }
+
+        auto find = [&](uint32_t t) {
+            while (parent[t] != t) {
+                parent[t] = parent[parent[t]];
+                t = parent[t];
+            }
+            return t;
+        };
+        auto unite = [&](uint32_t a, uint32_t b) {
+            a = find(a);
+            b = find(b);
+            if (a != b) {
+                parent[std::max(a, b)] = std::min(a, b);
+            }
+        };
+
+        for (uint32_t t = 0; t < triangleCount; t++) {
+            for (uint32_t k = 0; k < 3; k++) {
+                const uint32_t vertex = drawData.faceIndices[indexStart + t * 3 + k];
+                auto vertexIt = byVertex.emplace(vertex, t);
+                if (!vertexIt.second) {
+                    unite(vertexIt.first->second, t);
+                }
+
+                const interop::float4x4 *transform = nullptr;
+                ShadowVec3 p;
+                if (scenePosition(drawData, vertex, p.x, p.y, p.z, transform)) {
+                    const uint64_t qx = uint64_t(int64_t(std::lround(p.x * 4.0f)) & 0x1FFFFF);
+                    const uint64_t qy = uint64_t(int64_t(std::lround(p.y * 4.0f)) & 0x1FFFFF);
+                    const uint64_t qz = uint64_t(int64_t(std::lround(p.z * 4.0f)) & 0x1FFFFF);
+                    auto positionIt = byPosition.emplace((qx << 42) | (qy << 21) | qz, t);
+                    if (!positionIt.second) {
+                        unite(positionIt.first->second, t);
+                    }
+                }
+            }
+        }
+
+        triangleOrder.resize(triangleCount);
+        for (uint32_t t = 0; t < triangleCount; t++) {
+            triangleOrder[t] = t;
+        }
+        for (uint32_t t = 0; t < triangleCount; t++) {
+            parent[t] = find(t);
+        }
+        std::stable_sort(triangleOrder.begin(), triangleOrder.end(), [&](uint32_t l, uint32_t r) { return parent[l] < parent[r]; });
+
+        componentStarts.clear();
+        for (uint32_t i = 0; i < triangleCount; i++) {
+            if ((i == 0) || (parent[triangleOrder[i]] != parent[triangleOrder[i - 1]])) {
+                componentStarts.push_back(i);
+            }
+        }
+        componentStarts.push_back(triangleCount);
+    }
+
+    // Detects a small flat sprite that turns to face the camera, either around the vertical axis or fully. When
+    // it is one, its vertices are rebuilt turned around the vertical axis to face the light instead, so its
+    // shadow keeps the same shape from every camera angle.
+    static bool reorientBillboard(const DrawData &drawData, uint32_t indexStart, const uint32_t *triangles, uint32_t triangleCount, const ShadowCamera &camera, const interop::float3 &worldUp, const interop::float3 &lightDirection, std::vector<ShadowVertex> &vertices) {
+        vertices.clear();
+        if ((triangleCount == 0) || (triangleCount > 8)) {
+            return false;
+        }
+
+        thread_local std::vector<float> distances;
+        distances.clear();
+        const uint32_t indexCount = triangleCount * 3;
+        auto faceVertex = [&](uint32_t i) {
+            return drawData.faceIndices[indexStart + triangles[i / 3] * 3 + (i % 3)];
+        };
+        for (uint32_t i = 0; i < indexCount; i++) {
+            const uint32_t vertex = faceVertex(i);
+            bool known = false;
+            for (const ShadowVertex &existing : vertices) {
+                known = known || (existing.index == vertex);
+            }
+            if (known) {
+                continue;
+            }
+
+            const interop::float4x4 *transform = nullptr;
+            ShadowVertex shadowVertex;
+            shadowVertex.index = vertex;
+            if ((vertex >= drawData.posTransformed.size()) || !scenePosition(drawData, vertex, shadowVertex.position.x, shadowVertex.position.y, shadowVertex.position.z, transform)) {
+                return false;
+            }
+
+            vertices.push_back(shadowVertex);
+            distances.push_back(float(drawData.posTransformed[vertex][3]));
+        }
+
+        // Use the largest triangle for the plane so slivers don't decide it.
+        ShadowVec3 normal = { 0.0f, 0.0f, 0.0f };
+        float normalLength = 0.0f;
+        for (uint32_t i = 0; i + 2 < indexCount; i += 3) {
+            ShadowVec3 p[3];
+            for (uint32_t k = 0; k < 3; k++) {
+                const uint32_t vertex = faceVertex(i + k);
+                for (const ShadowVertex &shadowVertex : vertices) {
+                    if (shadowVertex.index == vertex) {
+                        p[k] = shadowVertex.position;
+                    }
+                }
+            }
+
+            const ShadowVec3 faceNormal = (p[1] - p[0]).cross(p[2] - p[0]);
+            const float faceLength = faceNormal.length();
+            if (faceLength > normalLength) {
+                normal = faceNormal;
+                normalLength = faceLength;
+            }
+        }
+        if (normalLength < 1e-6f) {
+            return false;
+        }
+        normal = normal * (1.0f / normalLength);
+
+        ShadowVec3 center = { 0.0f, 0.0f, 0.0f };
+        for (const ShadowVertex &shadowVertex : vertices) {
+            center = center + shadowVertex.position;
+        }
+        center = center * (1.0f / float(vertices.size()));
+
+        float extent = 0.0f;
+        for (const ShadowVertex &shadowVertex : vertices) {
+            extent = std::max(extent, (shadowVertex.position - center).length());
+        }
+        for (const ShadowVertex &shadowVertex : vertices) {
+            if (std::fabs((shadowVertex.position - center).dot(normal)) > (extent * 0.02f)) {
+                return false;
+            }
+        }
+
+        const ShadowVec3 up = { worldUp.x, worldUp.y, worldUp.z };
+        ShadowVec3 across = up.cross(normal);
+        const float acrossLength = across.length();
+        if (acrossLength < 0.3f) {
+            return false;
+        }
+        across = across * (1.0f / acrossLength);
+
+        ShadowVec3 along = normal.cross(across);
+        if (along.dot(up) < 0.0f) {
+            along = along * -1.0f;
+        }
+
+        // Upright sprites must face the camera horizontally, anything tilted must face it fully. Sloped level
+        // geometry would otherwise get stood up whenever the camera happens to line up with it.
+        const bool upright = std::fabs(normal.dot(up)) < 0.2f;
+        if (camera.valid) {
+            const float FacingCos = 0.985f;
+            ShadowVec3 toCamera = camera.position - center;
+            ShadowVec3 viewAxis = camera.forward;
+            ShadowVec3 facing = normal;
+            if (upright) {
+                toCamera = toCamera - up * toCamera.dot(up);
+                viewAxis = viewAxis - up * viewAxis.dot(up);
+                facing = facing - up * facing.dot(up);
+            }
+
+            const float toCameraLength = toCamera.length();
+            const float viewAxisLength = viewAxis.length();
+            const float facingLength = facing.length();
+            if (facingLength < 1e-4f) {
+                return false;
+            }
+            const bool facesPosition = (toCameraLength > 1e-4f) && (std::fabs(toCamera.dot(facing)) >= (FacingCos * toCameraLength * facingLength));
+            const bool facesPlane = (viewAxisLength > 1e-4f) && (std::fabs(viewAxis.dot(facing)) >= (FacingCos * viewAxisLength * facingLength));
+            if (!facesPosition && !facesPlane) {
+                return false;
+            }
+        }
+        else if (!upright) {
+            return false;
+        }
+
+        // Without a camera, an upright sprite faces it horizontally when the distance doesn't change across its width.
+        float meanA = 0.0f, meanB = 0.0f, meanD = 0.0f, minD = FLT_MAX, minA = FLT_MAX, maxA = -FLT_MAX;
+        thread_local std::vector<float> coordsA;
+        thread_local std::vector<float> coordsB;
+        coordsA.clear();
+        coordsB.clear();
+        for (uint32_t i = 0; i < vertices.size(); i++) {
+            const ShadowVec3 offset = vertices[i].position - center;
+            coordsA.push_back(offset.dot(across));
+            coordsB.push_back(offset.dot(along));
+            meanA += coordsA.back();
+            meanB += coordsB.back();
+            meanD += distances[i];
+            minD = std::min(minD, distances[i]);
+            minA = std::min(minA, coordsA.back());
+            maxA = std::max(maxA, coordsA.back());
+        }
+        const float invCount = 1.0f / float(vertices.size());
+        meanA *= invCount;
+        meanB *= invCount;
+        meanD *= invCount;
+
+        float sAA = 0.0f, sAB = 0.0f, sBB = 0.0f, sAD = 0.0f, sBD = 0.0f;
+        for (uint32_t i = 0; i < vertices.size(); i++) {
+            const float a = coordsA[i] - meanA;
+            const float b = coordsB[i] - meanB;
+            const float d = distances[i] - meanD;
+            sAA += a * a;
+            sAB += a * b;
+            sBB += b * b;
+            sAD += a * d;
+            sBD += b * d;
+        }
+        if (!camera.valid) {
+            const float determinant = sAA * sBB - sAB * sAB;
+            if (determinant <= (sAA * sBB * 1e-4f)) {
+                return false;
+            }
+            const float gradientA = (sAD * sBB - sBD * sAB) / determinant;
+            if ((std::fabs(gradientA) * (maxA - minA)) > (std::fabs(minD) * 0.004f)) {
+                return false;
+            }
+        }
+
+        ShadowVec3 lightAcross = up.cross({ lightDirection.x, lightDirection.y, lightDirection.z });
+        const float lightAcrossLength = lightAcross.length();
+        if (lightAcrossLength < 1e-3f) {
+            lightAcross = across;
+        }
+        else {
+            lightAcross = lightAcross * (1.0f / lightAcrossLength);
+            if (lightAcross.dot(across) < 0.0f) {
+                lightAcross = lightAcross * -1.0f;
+            }
+        }
+
+        for (uint32_t i = 0; i < vertices.size(); i++) {
+            vertices[i].position = center + lightAcross * coordsA[i] + up * coordsB[i];
+        }
+
+        return true;
+    }
+
+    static bool buildDirectionalShadow(const DrawData &drawData, float nativeWidth, float nativeHeight, const std::vector<ShadowFitRange> &ranges, const float localDirection[3], interop::float4x4 &lightMatrix, interop::float3 &lightDirection, interop::float3 &worldUp) {
+        struct Point {
+            float x, y, z;
+        };
+        struct Bucket {
+            int quantized[9] = {};
+            uint32_t weight = 0;
+            float m[3][3] = {};
+        };
+        thread_local std::vector<Point> visible;
+        thread_local std::vector<Bucket> buckets;
+        thread_local std::vector<float> distances;
+        visible.clear();
+        buckets.clear();
+
+        const float marginX = nativeWidth * 0.4f;
+        const float marginY = nativeHeight * 0.4f;
+        for (const ShadowFitRange &range : ranges) {
+            if (range.indexStart + range.indexCount > drawData.faceIndices.size()) {
+                continue;
+            }
+            for (uint32_t i = 0; i < range.indexCount; i++) {
+                const uint32_t vertex = drawData.faceIndices[range.indexStart + i];
+                const interop::float4x4 *transform = nullptr;
+                Point point;
+                if (!scenePosition(drawData, vertex, point.x, point.y, point.z, transform)) {
+                    continue;
+                }
+
+                const int quantized[9] = {
+                    quantizeRotation(transform->m[0][0]), quantizeRotation(transform->m[1][0]), quantizeRotation(transform->m[2][0]),
+                    quantizeRotation(transform->m[0][1]), quantizeRotation(transform->m[1][1]), quantizeRotation(transform->m[2][1]),
+                    quantizeRotation(transform->m[0][2]), quantizeRotation(transform->m[1][2]), quantizeRotation(transform->m[2][2])
+                };
+                int bucketIndex = -1;
+                for (uint32_t b = 0; b < buckets.size(); b++) {
+                    bool same = true;
+                    for (int k = 0; k < 9; k++) {
+                        same = same && (buckets[b].quantized[k] == quantized[k]);
+                    }
+                    if (same) {
+                        bucketIndex = int(b);
+                        break;
+                    }
+                }
+                if (bucketIndex < 0) {
+                    Bucket bucket;
+                    for (int k = 0; k < 9; k++) {
+                        bucket.quantized[k] = quantized[k];
+                    }
+                    bucket.m[0][0] = transform->m[0][0]; bucket.m[1][0] = transform->m[1][0]; bucket.m[2][0] = transform->m[2][0];
+                    bucket.m[0][1] = transform->m[0][1]; bucket.m[1][1] = transform->m[1][1]; bucket.m[2][1] = transform->m[2][1];
+                    bucket.m[0][2] = transform->m[0][2]; bucket.m[1][2] = transform->m[1][2]; bucket.m[2][2] = transform->m[2][2];
+                    buckets.push_back(bucket);
+                    bucketIndex = int(buckets.size() - 1);
+                }
+                buckets[bucketIndex].weight++;
+
+                bool onScreen = true;
+                if (vertex < drawData.posScreen.size()) {
+                    const float sx = drawData.posScreen[vertex][0];
+                    const float sy = drawData.posScreen[vertex][1];
+                    const float sz = drawData.posScreen[vertex][2];
+                    onScreen = (sx >= -marginX) && (sx <= nativeWidth + marginX) && (sy >= -marginY) && (sy <= nativeHeight + marginY) && (sz > -0.05f) && (sz < 1.02f);
+                }
+                if (onScreen) {
+                    visible.push_back(point);
+                }
+            }
+        }
+
+        if ((visible.size() < 3) || buckets.empty()) {
+            return false;
+        }
+
+        const Bucket *best = &buckets[0];
+        for (const Bucket &bucket : buckets) {
+            if (bucket.weight > best->weight) {
+                best = &bucket;
+            }
+        }
+        const float localX = localDirection[0];
+        const float localY = localDirection[1];
+        const float localZ = localDirection[2];
+        float dirX = localX * best->m[0][0] + localY * best->m[1][0] + localZ * best->m[2][0];
+        float dirY = localX * best->m[0][1] + localY * best->m[1][1] + localZ * best->m[2][1];
+        float dirZ = localX * best->m[0][2] + localY * best->m[1][2] + localZ * best->m[2][2];
+        float dirLength = std::sqrt(dirX * dirX + dirY * dirY + dirZ * dirZ);
+        if (dirLength < 1e-4f) {
+            dirX = localX;
+            dirY = localY;
+            dirZ = localZ;
+            dirLength = std::sqrt(dirX * dirX + dirY * dirY + dirZ * dirZ);
+            if (dirLength < 1e-4f) {
+                return false;
+            }
+        }
+        dirX /= dirLength;
+        dirY /= dirLength;
+        dirZ /= dirLength;
+
+        float centerX = 0.0f;
+        float centerY = 0.0f;
+        float centerZ = 0.0f;
+        for (const Point &point : visible) {
+            centerX += point.x;
+            centerY += point.y;
+            centerZ += point.z;
+        }
+        const float invCount = 1.0f / float(visible.size());
+        centerX *= invCount;
+        centerY *= invCount;
+        centerZ *= invCount;
+
+        distances.clear();
+        distances.reserve(visible.size());
+        for (const Point &point : visible) {
+            const float ox = point.x - centerX;
+            const float oy = point.y - centerY;
+            const float oz = point.z - centerZ;
+            distances.push_back(std::sqrt(ox * ox + oy * oy + oz * oz));
+        }
+        std::sort(distances.begin(), distances.end());
+        float keepDistance = distances[(distances.size() * 3) / 4];
+        if (keepDistance < 8.0f) {
+            keepDistance = 8.0f;
+        }
+        keepDistance *= 1.4f;
+
+        const float axisX = (std::fabs(dirY) > 0.85f) ? 1.0f : 0.0f;
+        const float axisY = (std::fabs(dirY) > 0.85f) ? 0.0f : 1.0f;
+        const float axisZ = 0.0f;
+        const float forwardX = -dirX;
+        const float forwardY = -dirY;
+        const float forwardZ = -dirZ;
+        float rightX = axisY * forwardZ - axisZ * forwardY;
+        float rightY = axisZ * forwardX - axisX * forwardZ;
+        float rightZ = axisX * forwardY - axisY * forwardX;
+        const float rightLength = std::sqrt(rightX * rightX + rightY * rightY + rightZ * rightZ);
+        if (rightLength < 1e-4f) {
+            return false;
+        }
+        rightX /= rightLength;
+        rightY /= rightLength;
+        rightZ /= rightLength;
+        const float upX = forwardY * rightZ - forwardZ * rightY;
+        const float upY = forwardZ * rightX - forwardX * rightZ;
+        const float upZ = forwardX * rightY - forwardY * rightX;
+
+        float minLX = FLT_MAX, maxLX = -FLT_MAX;
+        float minLY = FLT_MAX, maxLY = -FLT_MAX;
+        float minLZ = FLT_MAX, maxLZ = -FLT_MAX;
+        uint32_t kept = 0;
+        for (const Point &point : visible) {
+            const float ox = point.x - centerX;
+            const float oy = point.y - centerY;
+            const float oz = point.z - centerZ;
+            if (std::sqrt(ox * ox + oy * oy + oz * oz) > keepDistance) {
+                continue;
+            }
+            const float lightX = ox * rightX + oy * rightY + oz * rightZ;
+            const float lightY = ox * upX + oy * upY + oz * upZ;
+            const float lightZ = ox * forwardX + oy * forwardY + oz * forwardZ;
+            minLX = std::min(minLX, lightX);
+            maxLX = std::max(maxLX, lightX);
+            minLY = std::min(minLY, lightY);
+            maxLY = std::max(maxLY, lightY);
+            minLZ = std::min(minLZ, lightZ);
+            maxLZ = std::max(maxLZ, lightZ);
+            kept++;
+        }
+        if (kept < 3) {
+            return false;
+        }
+
+        const float padX = std::max((maxLX - minLX) * 0.12f, 8.0f);
+        const float padY = std::max((maxLY - minLY) * 0.12f, 8.0f);
+        const float padZ = std::max((maxLZ - minLZ) * 0.15f, 8.0f);
+        minLX -= padX;
+        maxLX += padX;
+        minLY -= padY;
+        maxLY += padY;
+        minLZ -= padZ;
+        maxLZ += padZ;
+        if (maxLX - minLX < 1.0f) {
+            minLX -= 0.5f;
+            maxLX += 0.5f;
+        }
+        if (maxLY - minLY < 1.0f) {
+            minLY -= 0.5f;
+            maxLY += 0.5f;
+        }
+        if (maxLZ - minLZ < 1.0f) {
+            minLZ -= 0.5f;
+            maxLZ += 0.5f;
+        }
+
+        const float shadowSize = float(ShadowMapSize);
+        const float texelX = (maxLX - minLX) / shadowSize;
+        const float texelY = (maxLY - minLY) / shadowSize;
+        minLX = std::floor(minLX / texelX) * texelX;
+        maxLX = std::ceil(maxLX / texelX) * texelX;
+        minLY = std::floor(minLY / texelY) * texelY;
+        maxLY = std::ceil(maxLY / texelY) * texelY;
+
+        const float view[4][4] = {
+            { rightX, rightY, rightZ, -(centerX * rightX + centerY * rightY + centerZ * rightZ) },
+            { upX, upY, upZ, -(centerX * upX + centerY * upY + centerZ * upZ) },
+            { forwardX, forwardY, forwardZ, -(centerX * forwardX + centerY * forwardY + centerZ * forwardZ) },
+            { 0.0f, 0.0f, 0.0f, 1.0f }
+        };
+        const float left = minLX;
+        const float right = maxLX;
+        const float bottom = minLY;
+        const float top = maxLY;
+        const float nearPlane = minLZ;
+        const float farPlane = maxLZ;
+        const float projection[4][4] = {
+            { 2.0f / (right - left), 0.0f, 0.0f, -(right + left) / (right - left) },
+            { 0.0f, 2.0f / (top - bottom), 0.0f, -(top + bottom) / (top - bottom) },
+            { 0.0f, 0.0f, 1.0f / (farPlane - nearPlane), -nearPlane / (farPlane - nearPlane) },
+            { 0.0f, 0.0f, 0.0f, 1.0f }
+        };
+
+        float combined[4][4];
+        for (int row = 0; row < 4; row++) {
+            for (int col = 0; col < 4; col++) {
+                combined[row][col] = projection[row][0] * view[0][col] + projection[row][1] * view[1][col] + projection[row][2] * view[2][col] + projection[row][3] * view[3][col];
+            }
+        }
+        for (int row = 0; row < 4; row++) {
+            for (int col = 0; col < 4; col++) {
+                lightMatrix.m[col][row] = combined[row][col];
+            }
+        }
+        lightDirection = interop::float3(dirX, dirY, dirZ);
+
+        const float upLength = std::sqrt(best->m[1][0] * best->m[1][0] + best->m[1][1] * best->m[1][1] + best->m[1][2] * best->m[1][2]);
+        if (upLength > 1e-4f) {
+            worldUp = interop::float3(best->m[1][0] / upLength, best->m[1][1] / upLength, best->m[1][2] / upLength);
+        }
+        else {
+            worldUp = interop::float3(0.0f, 1.0f, 0.0f);
+        }
+
+        return true;
+    }
+
+
     RasterScene::RasterScene() { }
 
     // FramebufferRenderer
@@ -194,6 +870,8 @@ namespace RT64 {
         frameParams.viewUbershaders = ubershadersVisible;
         frameParams.ditherNoiseStrength = ditherNoiseStrength;
         framebufferCount = 0;
+        shadowCutoutChunkCursor = 0;
+        shadowMapSetCursor = 0;
 
         // Create dummy color target if it hasn't been created yet.
         if (dummyColorTarget == nullptr) {
@@ -482,6 +1160,360 @@ namespace RT64 {
         worker->commandList->setFramebuffer(renderFramebuffer);
         depthState = readOnly;
         return true;
+    }
+
+    void FramebufferRenderer::submitSceneLighting(RenderWorker *worker, const Framebuffer &framebuffer, RenderFramebufferStorage *fbStorage, const RasterScene &rasterScene, bool &depthState) {
+        static_assert(sizeof(ShadowCasterCB) == 64, "Shadow caster push constant must match the shader.");
+        static_assert(sizeof(ShadowApplyCB) == 128, "Shadow apply push constant must match the shader.");
+        static_assert(offsetof(ShadowApplyCB, screenScaleOffset) == 64, "Shadow apply layout must match the shader.");
+        static_assert(offsetof(ShadowApplyCB, lightDirectionBias) == 96, "Shadow apply layout must match the shader.");
+
+        RenderTarget *colorTarget = fbStorage->colorTarget;
+        RenderTarget *depthTarget = fbStorage->depthTarget;
+        if ((colorTarget == nullptr) || (depthTarget == nullptr) || (colorTarget->texture == nullptr) || (depthTarget->texture == nullptr)) {
+            return;
+        }
+        if ((shaderLibrary == nullptr) || (shaderLibrary->shadowCaster.pipeline == nullptr) || (shaderLibrary->shadowApply.pipeline == nullptr)) {
+            return;
+        }
+        if ((lightingWorldPosBuffer == nullptr) || (lightingWorldPosSize < sizeof(float) * 4) || (lightingDrawData == nullptr)) {
+            return;
+        }
+        if ((rasterScene.viewportWidth < 1.0f) || (rasterScene.viewportHeight < 1.0f) || (rasterScene.nativeWidth < 1.0f) || (rasterScene.nativeHeight < 1.0f)) {
+            return;
+        }
+        if (!lightingSceneLight.enabled) {
+            return;
+        }
+
+        struct LitDraw {
+            uint32_t indexStart;
+            uint32_t indexCount;
+            interop::float2 screenScale;
+            interop::float2 screenOffset;
+            RenderRect scissor;
+            uint32_t instanceIndex;
+            bool caster;
+            bool receiver;
+            bool vertexTestZ;
+            bool cutout;
+            bool cameraFacing;
+        };
+        thread_local std::vector<LitDraw> litDraws;
+        thread_local std::vector<ShadowFitRange> fitRanges;
+        litDraws.clear();
+        fitRanges.clear();
+
+        for (uint32_t instanceIndex : rasterScene.instanceIndices) {
+            if (instanceIndex >= instanceDrawCallVector.size()) {
+                continue;
+            }
+            const InstanceDrawCall &drawCall = instanceDrawCallVector[instanceIndex];
+            if (drawCall.type != InstanceDrawCall::Type::IndexedTriangles) {
+                continue;
+            }
+            if ((drawCall.triangles.faceCount == 0) || drawCall.triangles.scissor.isEmpty()) {
+                continue;
+            }
+
+            LitDraw litDraw;
+            litDraw.indexStart = drawCall.triangles.indexStart;
+            litDraw.indexCount = drawCall.triangles.faceCount * 3;
+            litDraw.screenScale = drawCall.triangles.screenScale;
+            litDraw.screenOffset = drawCall.triangles.screenOffset;
+            litDraw.scissor = drawCall.triangles.scissor;
+            litDraw.vertexTestZ = drawCall.triangles.vertexTestZ;
+            const interop::OtherMode &otherMode = drawCall.triangles.shaderDesc.otherMode;
+            const bool copyMode = (otherMode.cycleType() == G_CYC_COPY);
+            const bool solidDepth = (otherMode.zMode() == ZMODE_OPA) || (otherMode.zMode() == ZMODE_INTER);
+            const bool alphaCutout = otherMode.cvgXAlpha() || otherMode.alphaCvgSel() || (otherMode.alphaCompare() != G_AC_NONE);
+            if (copyMode || !otherMode.zUpd() || !solidDepth) {
+                continue;
+            }
+
+            litDraw.instanceIndex = instanceIndex;
+            litDraw.cutout = alphaCutout;
+            litDraw.cameraFacing = alphaCutout && isCameraFacing(*lightingDrawData, litDraw.indexStart, litDraw.indexCount);
+            litDraw.caster = !drawCall.triangles.vertexTestZ;
+            litDraw.receiver = !litDraw.cameraFacing;
+
+            litDraws.push_back(litDraw);
+            if (!litDraw.vertexTestZ && !litDraw.cameraFacing) {
+                fitRanges.push_back({ litDraw.indexStart, litDraw.indexCount });
+            }
+        }
+        if (litDraws.empty()) {
+            return;
+        }
+
+        interop::float4x4 lightMatrix;
+        interop::float3 lightDirection;
+        interop::float3 worldUp;
+        if (!buildDirectionalShadow(*lightingDrawData, rasterScene.nativeWidth, rasterScene.nativeHeight, fitRanges, lightingSceneLight.direction, lightMatrix, lightDirection, worldUp)) {
+            return;
+        }
+
+        // Cutout casters are drawn from light space positions computed here, so billboards can be turned to
+        // face the light and their transparent texels can be discarded.
+        const uint32_t vertexCount = lightingDrawData->vertexCount();
+        const uint64_t cutoutPositionsSize = uint64_t(vertexCount) * sizeof(float) * 4;
+        const bool cutoutSupported = (shaderLibrary->shadowCutoutVertexShader != nullptr) && (shaderLibrary->shadowCutoutPixelShader != nullptr) &&
+            (rendererPipelineLayout != nullptr) && (descCommonSet != nullptr) && (descTextureSet != nullptr) && (vertexCount > 0);
+        const uint32_t MaxBillboardDrawTriangles = 512;
+        thread_local std::vector<ShadowVertex> billboardVertices;
+        thread_local std::vector<uint32_t> componentTriangles;
+        thread_local std::vector<uint32_t> componentStarts;
+        ShadowCamera shadowCamera;
+        bool cameraSearched = false;
+        float *cutoutPositions = nullptr;
+        RenderBuffer *cutoutBuffer = nullptr;
+        auto writeLightPosition = [&](uint32_t vertex, const ShadowVec3 &p) {
+            float *dst = &cutoutPositions[vertex * 4];
+            for (int row = 0; row < 4; row++) {
+                dst[row] = lightMatrix.m[0][row] * p.x + lightMatrix.m[1][row] * p.y + lightMatrix.m[2][row] * p.z + lightMatrix.m[3][row];
+            }
+        };
+
+        uint32_t cutoutCasterCount = 0;
+        for (LitDraw &litDraw : litDraws) {
+            if (!litDraw.caster || !litDraw.cutout) {
+                continue;
+            }
+
+            if (!cutoutSupported) {
+                litDraw.caster = false;
+                continue;
+            }
+
+            const uint32_t triangleCount = litDraw.indexCount / 3;
+            const bool splittable = (triangleCount <= MaxBillboardDrawTriangles) && (litDraw.indexStart + litDraw.indexCount <= lightingDrawData->faceIndices.size());
+            if (!splittable && litDraw.cameraFacing) {
+                litDraw.caster = false;
+                continue;
+            }
+
+            if (cutoutPositions == nullptr) {
+                if (shadowCutoutChunkCursor >= shadowCutoutChunks.size()) {
+                    shadowCutoutChunks.emplace_back();
+                }
+
+                ShadowCutoutChunk &chunk = shadowCutoutChunks[shadowCutoutChunkCursor++];
+                if (chunk.capacity < cutoutPositionsSize) {
+                    chunk.capacity = cutoutPositionsSize + cutoutPositionsSize / 2;
+                    chunk.buffer = worker->device->createBuffer(RenderBufferDesc::UploadBuffer(chunk.capacity, RenderBufferFlag::VERTEX));
+                }
+
+                cutoutBuffer = chunk.buffer.get();
+                cutoutPositions = static_cast<float *>(cutoutBuffer->map());
+            }
+
+            auto writeTriangle = [&](uint32_t triangle, bool hidden) {
+                for (uint32_t k = 0; k < 3; k++) {
+                    const uint32_t vertex = lightingDrawData->faceIndices[litDraw.indexStart + triangle * 3 + k];
+                    if (vertex >= vertexCount) {
+                        continue;
+                    }
+
+                    if (hidden) {
+                        // Outside the light's depth range, so depth clipping drops it.
+                        float *dst = &cutoutPositions[vertex * 4];
+                        dst[0] = 0.0f;
+                        dst[1] = 0.0f;
+                        dst[2] = -1.0f;
+                        dst[3] = 1.0f;
+                    }
+                    else {
+                        const interop::float4x4 *transform = nullptr;
+                        ShadowVec3 p = { 0.0f, 0.0f, 0.0f };
+                        scenePosition(*lightingDrawData, vertex, p.x, p.y, p.z, transform);
+                        writeLightPosition(vertex, p);
+                    }
+                }
+            };
+
+            if (!splittable) {
+                for (uint32_t t = 0; t < triangleCount; t++) {
+                    writeTriangle(t, false);
+                }
+                cutoutCasterCount++;
+                continue;
+            }
+
+            if (!cameraSearched) {
+                shadowCamera = findShadowCamera(*lightingDrawData, fitRanges);
+                cameraSearched = true;
+            }
+
+            splitShadowComponents(*lightingDrawData, litDraw.indexStart, litDraw.indexCount, componentTriangles, componentStarts);
+            bool allBillboards = true;
+            for (size_t c = 0; c + 1 < componentStarts.size(); c++) {
+                const uint32_t *triangles = &componentTriangles[componentStarts[c]];
+                const uint32_t count = componentStarts[c + 1] - componentStarts[c];
+                if (reorientBillboard(*lightingDrawData, litDraw.indexStart, triangles, count, shadowCamera, worldUp, lightDirection, billboardVertices)) {
+                    for (const ShadowVertex &shadowVertex : billboardVertices) {
+                        writeLightPosition(shadowVertex.index, shadowVertex.position);
+                    }
+                }
+                else {
+                    allBillboards = false;
+                    for (uint32_t t = 0; t < count; t++) {
+                        writeTriangle(triangles[t], litDraw.cameraFacing);
+                    }
+                }
+            }
+
+            // Billboards don't receive, since their camera facing surface doesn't match the light facing caster.
+            if (allBillboards) {
+                litDraw.receiver = false;
+            }
+
+            cutoutCasterCount++;
+        }
+
+        if (cutoutBuffer != nullptr) {
+            cutoutBuffer->unmap();
+        }
+
+        if ((cutoutCasterCount > 0) && ((shadowCutoutPipeline == nullptr) || (shadowCutoutPipelineLayout != rendererPipelineLayout))) {
+            static const RenderInputElement cutoutInputElements[] = {
+                RenderInputElement("POSITION", 0, 0, RenderFormat::R32G32B32A32_FLOAT, 0, 0),
+                RenderInputElement("TEXCOORD", 0, 1, RenderFormat::R32G32_FLOAT, 1, 0),
+                RenderInputElement("COLOR", 0, 2, RenderFormat::R32G32B32A32_FLOAT, 2, 0)
+            };
+
+            RenderGraphicsPipelineDesc pipelineDesc;
+            pipelineDesc.pipelineLayout = rendererPipelineLayout;
+            pipelineDesc.vertexShader = shaderLibrary->shadowCutoutVertexShader.get();
+            pipelineDesc.pixelShader = shaderLibrary->shadowCutoutPixelShader.get();
+            pipelineDesc.renderTargetBlend[0] = RenderBlendDesc::Copy();
+            pipelineDesc.renderTargetBlend[0].renderTargetWriteMask = uint8_t(RenderColorWriteEnable::RED);
+            pipelineDesc.renderTargetFormat[0] = RenderFormat::R32_FLOAT;
+            pipelineDesc.renderTargetCount = 1;
+            pipelineDesc.depthEnabled = true;
+            pipelineDesc.depthWriteEnabled = true;
+            pipelineDesc.depthFunction = RenderComparisonFunction::LESS;
+            pipelineDesc.depthBias = 2500;
+            pipelineDesc.slopeScaledDepthBias = 2.5f;
+            pipelineDesc.depthClipEnabled = true;
+            pipelineDesc.depthTargetFormat = RenderFormat::D32_FLOAT;
+            pipelineDesc.cullMode = RenderCullMode::NONE;
+            pipelineDesc.inputSlots = vertexInputSlots.data();
+            pipelineDesc.inputSlotsCount = uint32_t(vertexInputSlots.size());
+            pipelineDesc.inputElements = cutoutInputElements;
+            pipelineDesc.inputElementsCount = uint32_t(std::size(cutoutInputElements));
+            shadowCutoutPipeline = worker->device->createGraphicsPipeline(pipelineDesc);
+            shadowCutoutPipelineLayout = rendererPipelineLayout;
+        }
+
+        if (shadowDepth == nullptr) {
+            RenderClearValue depthClear = RenderClearValue::Depth(RenderDepth(), RenderFormat::D32_FLOAT);
+            shadowColor = worker->device->createTexture(RenderTextureDesc::ColorTarget(ShadowMapSize, ShadowMapSize, RenderFormat::R32_FLOAT));
+            shadowColor->setName("Scene Shadow Map");
+            shadowColorView = shadowColor->createTextureView(RenderTextureViewDesc::Texture2D(RenderFormat::R32_FLOAT));
+            shadowDepth = worker->device->createTexture(RenderTextureDesc::DepthTarget(ShadowMapSize, ShadowMapSize, RenderFormat::D32_FLOAT, RenderMultisampling(), &depthClear));
+            shadowDepth->setName("Scene Shadow Depth");
+            const RenderTexture *shadowColorAttachment = shadowColor.get();
+            shadowFramebuffer = worker->device->createFramebuffer(RenderFramebufferDesc(&shadowColorAttachment, 1, shadowDepth.get()));
+        }
+
+        if (shadowMapSetCursor >= shadowMapSets.size()) {
+            shadowMapSets.emplace_back(std::make_unique<ShadowMapDescriptorSet>(worker->device));
+        }
+        ShadowMapDescriptorSet *shadowMapSet = shadowMapSets[shadowMapSetCursor++].get();
+
+        ShadowApplyCB applyCB;
+        applyCB.lightViewProj = lightMatrix;
+        applyCB.resolutionShadow = interop::float4(rasterScene.nativeWidth, rasterScene.nativeHeight, float(ShadowMapSize), float(ShadowMapSize));
+        applyCB.lightDirectionBias = interop::float4(lightDirection.x, lightDirection.y, lightDirection.z, 0.0012f);
+        applyCB.shadowTint = interop::float4(lightingSceneLight.shadowTint[0], lightingSceneLight.shadowTint[1], lightingSceneLight.shadowTint[2], lightingSceneLight.facingFloor);
+
+        worker->commandList->barriers(RenderBarrierStage::GRAPHICS, RenderBufferBarrier(const_cast<RenderBuffer *>(lightingWorldPosBuffer), RenderBufferAccess::READ));
+        RenderTextureBarrier shadowWrite[] = {
+            RenderTextureBarrier(shadowColor.get(), RenderTextureLayout::COLOR_WRITE),
+            RenderTextureBarrier(shadowDepth.get(), RenderTextureLayout::DEPTH_WRITE)
+        };
+        worker->commandList->barriers(RenderBarrierStage::GRAPHICS, shadowWrite, uint32_t(std::size(shadowWrite)));
+        worker->commandList->setFramebuffer(shadowFramebuffer.get());
+        worker->commandList->setViewports(RenderViewport(0.0f, 0.0f, float(ShadowMapSize), float(ShadowMapSize)));
+        worker->commandList->setScissors(RenderRect(0, 0, ShadowMapSize, ShadowMapSize));
+        worker->commandList->clearColor(0, RenderColor(1.0f, 1.0f, 1.0f, 1.0f));
+        worker->commandList->clearDepth();
+
+        const RenderInputSlot casterSlot(0, sizeof(float) * 4);
+        const RenderVertexBufferView worldView(RenderBufferReference(lightingWorldPosBuffer), lightingWorldPosSize);
+        worker->commandList->setPipeline(shaderLibrary->shadowCaster.pipeline.get());
+        worker->commandList->setGraphicsPipelineLayout(shaderLibrary->shadowCaster.pipelineLayout.get());
+        worker->commandList->setGraphicsPushConstants(0, &applyCB.lightViewProj);
+        worker->commandList->setVertexBuffers(0, &worldView, 1, &casterSlot);
+        worker->commandList->setIndexBuffer(&indexBufferView);
+        for (const LitDraw &litDraw : litDraws) {
+            if (!litDraw.caster || litDraw.cutout) {
+                continue;
+            }
+            worker->commandList->drawIndexedInstanced(litDraw.indexCount, 1, litDraw.indexStart, 0, 0);
+        }
+
+        if ((cutoutCasterCount > 0) && (shadowCutoutPipeline != nullptr)) {
+            worker->commandList->setPipeline(shadowCutoutPipeline.get());
+            worker->commandList->setGraphicsPipelineLayout(rendererPipelineLayout);
+            worker->commandList->setGraphicsDescriptorSet(descCommonSet->get(), 0);
+            worker->commandList->setGraphicsDescriptorSet(descTextureSet->get(), 1);
+            worker->commandList->setGraphicsDescriptorSet(descTextureSet->get(), 2);
+            worker->commandList->setGraphicsDescriptorSet(framebuffer.descDummyFbSet->get(), 3);
+
+            const RenderVertexBufferView cutoutViews[] = {
+                RenderVertexBufferView(RenderBufferReference(cutoutBuffer), uint32_t(cutoutPositionsSize)),
+                indexedVertexViews[1],
+                indexedVertexViews[2]
+            };
+            worker->commandList->setVertexBuffers(0, cutoutViews, uint32_t(std::size(cutoutViews)), vertexInputSlots.data());
+            worker->commandList->setIndexBuffer(&indexBufferView);
+
+            interop::RasterParams rasterParams;
+            rasterParams.screenScale = interop::float2(1.0f, 1.0f);
+            rasterParams.screenOffset = interop::float2(0.0f, 0.0f);
+            for (const LitDraw &litDraw : litDraws) {
+                if (!litDraw.caster || !litDraw.cutout) {
+                    continue;
+                }
+                rasterParams.renderIndex = litDraw.instanceIndex;
+                worker->commandList->setGraphicsPushConstants(0, &rasterParams);
+                worker->commandList->drawIndexedInstanced(litDraw.indexCount, 1, litDraw.indexStart, 0, 0);
+            }
+        }
+
+        worker->commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(shadowColor.get(), RenderTextureLayout::SHADER_READ));
+        shadowMapSet->setTexture(shadowMapSet->gShadowMap, shadowColor.get(), RenderTextureLayout::SHADER_READ, shadowColorView.get());
+        shadowMapSet->setTexture(shadowMapSet->gSceneDepth, depthTarget->texture.get(), RenderTextureLayout::DEPTH_READ, depthTarget->textureView.get());
+
+        worker->commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(depthTarget->texture.get(), RenderTextureLayout::DEPTH_READ));
+        worker->commandList->setFramebuffer(fbStorage->colorWriteDepthRead.get());
+        depthState = true;
+        worker->commandList->setViewports(RenderViewport(rasterScene.viewportX, rasterScene.viewportY, rasterScene.viewportWidth, rasterScene.viewportHeight));
+        worker->commandList->setPipeline(shaderLibrary->shadowApply.pipeline.get());
+        worker->commandList->setGraphicsPipelineLayout(shaderLibrary->shadowApply.pipelineLayout.get());
+        worker->commandList->setGraphicsDescriptorSet(shadowMapSet->get(), 0);
+
+        const RenderInputSlot applySlots[] = {
+            RenderInputSlot(0, sizeof(float) * 4),
+            RenderInputSlot(1, sizeof(float) * 4)
+        };
+        const RenderVertexBufferView applyViews[] = { indexedVertexViews[0], worldView };
+        worker->commandList->setVertexBuffers(0, applyViews, 2, applySlots);
+        for (const LitDraw &litDraw : litDraws) {
+            if (!litDraw.receiver) {
+                continue;
+            }
+            applyCB.screenScaleOffset = interop::float4(litDraw.screenScale.x, litDraw.screenScale.y, litDraw.screenOffset.x, litDraw.screenOffset.y);
+            worker->commandList->setGraphicsPushConstants(0, &applyCB);
+            worker->commandList->setScissors(litDraw.scissor);
+            worker->commandList->setIndexBuffer(litDraw.vertexTestZ ? &testZIndexBufferView : &indexBufferView);
+            worker->commandList->drawIndexedInstanced(litDraw.indexCount, 1, litDraw.indexStart, 0, 0);
+        }
+
+        worker->commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(depthTarget->texture.get(), RenderTextureLayout::DEPTH_WRITE));
+        worker->commandList->setFramebuffer(fbStorage->colorDepthWrite.get());
+        depthState = false;
     }
     
     void FramebufferRenderer::submitRasterScene(RenderWorker *worker, const Framebuffer &framebuffer, RenderFramebufferStorage *fbStorage, const RasterScene &rasterScene, bool &depthState) {
@@ -1316,6 +2348,9 @@ namespace RT64 {
                 const RasterScene &rasterScene = targetDrawCall.rasterScenes[pair.first];
                 submitDepthAccess(worker, targetDrawCall.fbStorage, false, depthState);
                 submitRasterScene(worker, framebuffer, targetDrawCall.fbStorage, rasterScene, depthState);
+                if (rasterScene.lightable) {
+                    submitSceneLighting(worker, framebuffer, targetDrawCall.fbStorage, rasterScene, depthState);
+                }
             }
         }
     }
@@ -1410,6 +2445,10 @@ namespace RT64 {
         rawVertexViews[2] = RenderVertexBufferView(RenderBufferReference(triColRes), ColStride * rawTriVertexCount);
         testZIndexBuffer = outputBuffers.testZIndexBuffer.buffer.get();
         testZIndexBufferView = RenderIndexBufferView(testZIndexBuffer, uint32_t(outputBuffers.testZIndexBuffer.allocatedSize), RenderFormat::R32_UINT);
+        lightingDrawData = &drawData;
+        lightingSceneLight = p.curWorkload->extended.sceneLight;
+        lightingWorldPosBuffer = worldPosRes;
+        lightingWorldPosSize = uint32_t(outputBuffers.worldPosBuffer.computedSize);
 
         RasterScene rasterScene;
         auto checkRasterScene = [&](RasterScene &rasterScene) {
@@ -1474,6 +2513,22 @@ namespace RT64 {
             const Projection &proj = fbPair.projections[pr];
             if (proj.scissorRect.isNull()) {
                 continue;
+            }
+
+            // Keep the 3D view in its own scene so lighting runs before the HUD is drawn on top.
+            const bool projLightable = p.advancedLighting && ((proj.type == Projection::Type::Perspective) || (proj.type == Projection::Type::Orthographic));
+            if (!rasterScene.instanceIndices.empty() && (rasterScene.lightable != projLightable)) {
+                checkRasterScene(rasterScene);
+                rasterScene.lightable = false;
+            }
+            if (projLightable) {
+                rasterScene.lightable = true;
+                rasterScene.nativeWidth = fbParams.resolution.x;
+                rasterScene.nativeHeight = fbParams.resolution.y;
+                rasterScene.viewportX = framebuffer.viewport.x;
+                rasterScene.viewportY = framebuffer.viewport.y;
+                rasterScene.viewportWidth = framebuffer.viewport.width;
+                rasterScene.viewportHeight = framebuffer.viewport.height;
             }
 
 #       if RT_ENABLED

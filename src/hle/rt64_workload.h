@@ -20,6 +20,7 @@
 #include "rt64_framebuffer_manager.h"
 #include "rt64_framebuffer_pair.h"
 #include "rt64_framebuffer_storage.h"
+#include "rt64_scene_light.h"
 #include "rt64_transform_group.h"
 
 namespace RT64 {
@@ -238,6 +239,7 @@ namespace RT64 {
         struct {
             uint32_t testZIndexCount = 0;
             float ditherNoiseStrength = 1.0f;
+            SceneLight sceneLight;
         } extended;
 
         void reset();

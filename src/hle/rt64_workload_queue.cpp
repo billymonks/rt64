@@ -388,7 +388,7 @@ namespace RT64 {
                 rspProcessor->process(rspParams);
             }
 
-            const bool processWorldVertices = prevFrame.matched;
+            const bool processWorldVertices = prevFrame.matched || ext.sharedResources->userConfig.advancedLighting;
             if (processWorldVertices) {
                 workload.resetWorldOutputBuffers();
 
@@ -634,6 +634,7 @@ namespace RT64 {
                     drawParams.horizontalMisalignment = (colorTarget != nullptr) ? float(colorTarget->misalignX) : float(depthTarget->misalignX);
                     drawParams.presetScene = curFrame.presetScene;
                     drawParams.rtEnabled = workloadConfig.raytracingEnabled;
+                    drawParams.advancedLighting = ext.sharedResources->userConfig.advancedLighting;
                     drawParams.submissionFrame = workload.submissionFrame;
                     drawParams.deltaTimeMs = deltaTimeMs;
                     drawParams.ubershadersOnly = ubershadersOnly;

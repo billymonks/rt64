@@ -10,6 +10,7 @@
 
 #include "common/rt64_common.h"
 #include "common/rt64_plume.h"
+#include "shared/rt64_hlsl.h"
 
 #include "rt64_sampler_library.h"
 
@@ -621,6 +622,34 @@ namespace RT64 {
             dstPos = builder.addReadWriteStructuredBuffer(8);
             dstNorm = builder.addReadWriteStructuredBuffer(9);
             dstVel = builder.addReadWriteStructuredBuffer(10);
+            builder.end();
+
+            if (device != nullptr) {
+                create(device);
+            }
+        }
+    };
+
+    struct ShadowCasterCB {
+        interop::float4x4 lightViewProj;
+    };
+
+    struct ShadowApplyCB {
+        interop::float4x4 lightViewProj;
+        interop::float4 screenScaleOffset;
+        interop::float4 resolutionShadow;
+        interop::float4 lightDirectionBias;
+        interop::float4 shadowTint;
+    };
+
+    struct ShadowMapDescriptorSet : RenderDescriptorSetBase {
+        uint32_t gShadowMap;
+        uint32_t gSceneDepth;
+
+        ShadowMapDescriptorSet(RenderDevice *device = nullptr) {
+            builder.begin();
+            gShadowMap = builder.addTexture(1);
+            gSceneDepth = builder.addTexture(2);
             builder.end();
 
             if (device != nullptr) {

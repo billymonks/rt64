@@ -38,6 +38,13 @@ namespace RT64 {
 
     struct RasterScene {
         std::vector<uint32_t> instanceIndices;
+        bool lightable = false;
+        float nativeWidth = 0.0f;
+        float nativeHeight = 0.0f;
+        float viewportX = 0.0f;
+        float viewportY = 0.0f;
+        float viewportWidth = 0.0f;
+        float viewportHeight = 0.0f;
 
         RasterScene();
     };
@@ -123,6 +130,27 @@ namespace RT64 {
         std::vector<Framebuffer> framebufferVector;
         std::vector<BufferUploader *> pendingUploaders;
         uint32_t framebufferCount = 0;
+        std::unique_ptr<RenderTexture> shadowColor;
+        std::unique_ptr<RenderTextureView> shadowColorView;
+        std::unique_ptr<RenderTexture> shadowDepth;
+        std::unique_ptr<RenderFramebuffer> shadowFramebuffer;
+        std::vector<std::unique_ptr<ShadowMapDescriptorSet>> shadowMapSets;
+        uint32_t shadowMapSetCursor = 0;
+        const RenderBuffer *lightingWorldPosBuffer = nullptr;
+        uint32_t lightingWorldPosSize = 0;
+        const DrawData *lightingDrawData = nullptr;
+        SceneLight lightingSceneLight;
+        std::unique_ptr<RenderPipeline> shadowCutoutPipeline;
+        const RenderPipelineLayout *shadowCutoutPipelineLayout = nullptr;
+
+        // Light space positions for the cutout shadow casters, written by the CPU. A chunk is never reused
+        // within a workload because its earlier contents may still be read by commands recorded before.
+        struct ShadowCutoutChunk {
+            std::unique_ptr<RenderBuffer> buffer;
+            uint64_t capacity = 0;
+        };
+        std::vector<ShadowCutoutChunk> shadowCutoutChunks;
+        uint32_t shadowCutoutChunkCursor = 0;
 
         struct DrawParams {
             RenderWorker *worker;
@@ -140,7 +168,8 @@ namespace RT64 {
             float extAspectPercentage;
             float horizontalMisalignment;
             PresetScene presetScene;
-            bool rtEnabled;
+            bool rtEnabled = false;
+            bool advancedLighting = false;
             uint64_t submissionFrame;
             float deltaTimeMs;
             bool ubershadersOnly;
@@ -166,6 +195,7 @@ namespace RT64 {
         void submitRSPSmoothNormalCompute(RenderWorker *worker, const OutputBuffers *outputBuffers);
         bool submitDepthAccess(RenderWorker *worker, RenderFramebufferStorage *fbStorage, bool readOnly, bool &depthState);
         void submitRasterScene(RenderWorker *worker, const Framebuffer &framebuffer, RenderFramebufferStorage *fbStorage, const RasterScene &rasterScene, bool &depthState);
+        void submitSceneLighting(RenderWorker *worker, const Framebuffer &framebuffer, RenderFramebufferStorage *fbStorage, const RasterScene &rasterScene, bool &depthState);
         void addFramebuffer(const DrawParams &p);
         void endFramebuffers(RenderWorker *worker, const DrawBuffers *drawBuffers, const OutputBuffers *outputBuffers, bool rtEnabled);
         void recordSetup(RenderWorker *worker, std::vector<BufferUploader *> bufferUploaders, RSPProcessor *rspProcessor, VertexProcessor *vertexProcessor, const OutputBuffers *outputBuffers, bool rtEnabled);

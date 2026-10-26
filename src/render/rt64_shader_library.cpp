@@ -39,6 +39,13 @@
 #include "shaders/RtCopyDepthToColor2XPS.hlsl.spirv.h"
 #include "shaders/RtCopyDepthToColor4XPS.hlsl.spirv.h"
 #include "shaders/RtCopyDepthToColor8XPS.hlsl.spirv.h"
+#include "shaders/ShadowCasterVS.hlsl.spirv.h"
+#include "shaders/ShadowCasterPS.hlsl.spirv.h"
+#include "shaders/ShadowApplyVS.hlsl.spirv.h"
+#include "shaders/ShadowApplyPS.hlsl.spirv.h"
+#include "shaders/ShadowApplyPSMS.hlsl.spirv.h"
+#include "shaders/ShadowCutoutVS.hlsl.spirv.h"
+#include "shaders/ShadowCutoutPS.hlsl.spirv.h"
 #include "shaders/TextureCopyPS.hlsl.spirv.h"
 #include "shaders/TextureDecodeCS.hlsl.spirv.h"
 #include "shaders/TextureResolveSamples2XPS.hlsl.spirv.h"
@@ -85,6 +92,13 @@
 #   include "shaders/RtCopyDepthToColor2XPS.hlsl.dxil.h"
 #   include "shaders/RtCopyDepthToColor4XPS.hlsl.dxil.h"
 #   include "shaders/RtCopyDepthToColor8XPS.hlsl.dxil.h"
+#   include "shaders/ShadowCasterVS.hlsl.dxil.h"
+#   include "shaders/ShadowCasterPS.hlsl.dxil.h"
+#   include "shaders/ShadowApplyVS.hlsl.dxil.h"
+#   include "shaders/ShadowApplyPS.hlsl.dxil.h"
+#   include "shaders/ShadowApplyPSMS.hlsl.dxil.h"
+#   include "shaders/ShadowCutoutVS.hlsl.dxil.h"
+#   include "shaders/ShadowCutoutPS.hlsl.dxil.h"
 #   include "shaders/TextureCopyPS.hlsl.dxil.h"
 #   include "shaders/TextureDecodeCS.hlsl.dxil.h"
 #   include "shaders/TextureResolveSamples2XPS.hlsl.dxil.h"
@@ -130,6 +144,13 @@
 #   include "shaders/RtCopyDepthToColor2XPS.hlsl.metal.h"
 #   include "shaders/RtCopyDepthToColor4XPS.hlsl.metal.h"
 #   include "shaders/RtCopyDepthToColor8XPS.hlsl.metal.h"
+#   include "shaders/ShadowCasterVS.hlsl.metal.h"
+#   include "shaders/ShadowCasterPS.hlsl.metal.h"
+#   include "shaders/ShadowApplyVS.hlsl.metal.h"
+#   include "shaders/ShadowApplyPS.hlsl.metal.h"
+#   include "shaders/ShadowApplyPSMS.hlsl.metal.h"
+#   include "shaders/ShadowCutoutVS.hlsl.metal.h"
+#   include "shaders/ShadowCutoutPS.hlsl.metal.h"
 #   include "shaders/TextureCopyPS.hlsl.metal.h"
 #   include "shaders/TextureDecodeCS.hlsl.metal.h"
 #   include "shaders/TextureResolveSamples2XPS.hlsl.metal.h"
@@ -619,6 +640,45 @@ namespace RT64 {
             pipelineDesc.pipelineLayout = videoInterfacePixel.pipelineLayout.get();
             videoInterfacePixel.pipeline = device->createGraphicsPipeline(pipelineDesc);
         }
+
+        // Depth-only shadow map pass. The light matrix arrives as a push constant.
+        {
+            layoutBuilder.begin(false, true);
+            layoutBuilder.addPushConstant(0, 0, sizeof(ShadowCasterCB), RenderShaderStageFlag::VERTEX);
+            layoutBuilder.end();
+            shadowCaster.pipelineLayout = layoutBuilder.create(device);
+
+            const RenderInputSlot inputSlot(0, sizeof(float) * 4);
+            const RenderInputElement inputElement("POSITION", 0, 0, RenderFormat::R32G32B32A32_FLOAT, 0, 0);
+            std::unique_ptr<RenderShader> vertexShader = device->createShader(CREATE_SHADER_INPUTS(ShadowCasterVSBlobDXIL, ShadowCasterVSBlobSPIRV, ShadowCasterVSBlobMSL, "VSMain", shaderFormat));
+            std::unique_ptr<RenderShader> pixelShader = device->createShader(CREATE_SHADER_INPUTS(ShadowCasterPSBlobDXIL, ShadowCasterPSBlobSPIRV, ShadowCasterPSBlobMSL, "PSMain", shaderFormat));
+            RenderGraphicsPipelineDesc pipelineDesc;
+            pipelineDesc.pipelineLayout = shadowCaster.pipelineLayout.get();
+            pipelineDesc.vertexShader = vertexShader.get();
+            pipelineDesc.pixelShader = pixelShader.get();
+            pipelineDesc.renderTargetBlend[0] = RenderBlendDesc::Copy();
+            pipelineDesc.renderTargetBlend[0].renderTargetWriteMask = uint8_t(RenderColorWriteEnable::RED);
+            pipelineDesc.renderTargetFormat[0] = RenderFormat::R32_FLOAT;
+            pipelineDesc.renderTargetCount = 1;
+            pipelineDesc.depthEnabled = true;
+            pipelineDesc.depthWriteEnabled = true;
+            pipelineDesc.depthFunction = RenderComparisonFunction::LESS;
+            pipelineDesc.depthBias = 2500;
+            pipelineDesc.slopeScaledDepthBias = 2.5f;
+            pipelineDesc.depthClipEnabled = true;
+            pipelineDesc.depthTargetFormat = RenderFormat::D32_FLOAT;
+            pipelineDesc.cullMode = RenderCullMode::NONE;
+            pipelineDesc.inputSlots = &inputSlot;
+            pipelineDesc.inputSlotsCount = 1;
+            pipelineDesc.inputElements = &inputElement;
+            pipelineDesc.inputElementsCount = 1;
+            shadowCaster.pipeline = device->createGraphicsPipeline(pipelineDesc);
+        }
+
+        // Shadow casters with transparent texels. The pipeline uses the raster ubershader's layout, so the
+        // framebuffer renderer creates it.
+        shadowCutoutVertexShader = device->createShader(CREATE_SHADER_INPUTS(ShadowCutoutVSBlobDXIL, ShadowCutoutVSBlobSPIRV, ShadowCutoutVSBlobMSL, "VSMain", shaderFormat));
+        shadowCutoutPixelShader = device->createShader(CREATE_SHADER_INPUTS(ShadowCutoutPSBlobDXIL, ShadowCutoutPSBlobSPIRV, ShadowCutoutPSBlobMSL, "PSMain", shaderFormat));
     }
 
     void ShaderLibrary::setupMultisamplingShaders(RenderInterface *rhi, RenderDevice *device, const RenderMultisampling &multisampling) {
@@ -830,6 +890,63 @@ namespace RT64 {
                 pipelineDesc.multisampling = multisampling;
                 rtCopyColorToDepthMS.pipeline = device->createGraphicsPipeline(pipelineDesc);
             }
+        }
+
+        // Multiply the directional light onto the scene. MSAA must match the color target.
+        {
+            ShadowMapDescriptorSet descriptorSet;
+            layoutBuilder.begin(false, true);
+            layoutBuilder.addPushConstant(0, 0, sizeof(ShadowApplyCB), RenderShaderStageFlag::VERTEX | RenderShaderStageFlag::PIXEL);
+            layoutBuilder.addDescriptorSet(descriptorSet);
+            layoutBuilder.end();
+            shadowApply.pipelineLayout = layoutBuilder.create(device);
+
+            const RenderInputSlot inputSlots[] = {
+                RenderInputSlot(0, sizeof(float) * 4),
+                RenderInputSlot(1, sizeof(float) * 4)
+            };
+            const RenderInputElement inputElements[] = {
+                RenderInputElement("POSITION", 0, 0, RenderFormat::R32G32B32A32_FLOAT, 0, 0),
+                RenderInputElement("TEXCOORD", 0, 1, RenderFormat::R32G32B32A32_FLOAT, 1, 0)
+            };
+            RenderBlendDesc shadeBlend;
+            shadeBlend.blendEnabled = true;
+            shadeBlend.srcBlend = RenderBlend::DEST_COLOR;
+            shadeBlend.dstBlend = RenderBlend::ZERO;
+            shadeBlend.blendOp = RenderBlendOperation::ADD;
+            shadeBlend.srcBlendAlpha = RenderBlend::ZERO;
+            shadeBlend.dstBlendAlpha = RenderBlend::ONE;
+            shadeBlend.blendOpAlpha = RenderBlendOperation::ADD;
+
+            std::unique_ptr<RenderShader> vertexShader = device->createShader(CREATE_SHADER_INPUTS(ShadowApplyVSBlobDXIL, ShadowApplyVSBlobSPIRV, ShadowApplyVSBlobMSL, "VSMain", shaderFormat));
+            std::unique_ptr<RenderShader> pixelShader;
+            if (multisampling.sampleCount != RenderSampleCount::COUNT_1) {
+                pixelShader = device->createShader(CREATE_SHADER_INPUTS(ShadowApplyPSMSBlobDXIL, ShadowApplyPSMSBlobSPIRV, ShadowApplyPSMSBlobMSL, "PSMain", shaderFormat));
+            }
+            else {
+                pixelShader = device->createShader(CREATE_SHADER_INPUTS(ShadowApplyPSBlobDXIL, ShadowApplyPSBlobSPIRV, ShadowApplyPSBlobMSL, "PSMain", shaderFormat));
+            }
+            RenderGraphicsPipelineDesc pipelineDesc;
+            pipelineDesc.pipelineLayout = shadowApply.pipelineLayout.get();
+            pipelineDesc.renderTargetBlend[0] = shadeBlend;
+            pipelineDesc.renderTargetFormat[0] = RenderTarget::colorBufferFormat(usesHDR);
+            pipelineDesc.renderTargetCount = 1;
+            pipelineDesc.vertexShader = vertexShader.get();
+            pipelineDesc.pixelShader = pixelShader.get();
+            pipelineDesc.depthEnabled = true;
+            pipelineDesc.depthWriteEnabled = false;
+            pipelineDesc.depthFunction = RenderComparisonFunction::LESS_EQUAL;
+            pipelineDesc.depthBias = -8;
+            pipelineDesc.slopeScaledDepthBias = -1.0f;
+            pipelineDesc.depthClipEnabled = false;
+            pipelineDesc.depthTargetFormat = RenderFormat::D32_FLOAT;
+            pipelineDesc.cullMode = RenderCullMode::NONE;
+            pipelineDesc.multisampling = multisampling;
+            pipelineDesc.inputSlots = inputSlots;
+            pipelineDesc.inputSlotsCount = uint32_t(std::size(inputSlots));
+            pipelineDesc.inputElements = inputElements;
+            pipelineDesc.inputElementsCount = uint32_t(std::size(inputElements));
+            shadowApply.pipeline = device->createGraphicsPipeline(pipelineDesc);
         }
 
         // Post process.

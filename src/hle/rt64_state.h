@@ -128,6 +128,7 @@ namespace RT64 {
             bool vertexTestZActive = false;
             float ditherNoiseStrength = 1.0f;
             bool extendRDRAM = false;
+            SceneLight sceneLight;
         };
 
         Extended extended;
@@ -160,6 +161,7 @@ namespace RT64 {
         void setRefreshRate(uint16_t refreshRate);
         void setRenderToRAM(uint8_t renderToRAM);
         void setDitherNoiseStrength(float noiseStrength);
+        void setSceneLight(const SceneLight &sceneLight);
         void setExtendedRDRAM(bool isExtended);
         void startSpriteCommand(uint64_t replacementHash);
         void endSpriteCommand();

@@ -52,11 +52,15 @@ namespace RT64 {
         ShaderRecord rtCopyColorToDepthMS;
         ShaderRecord rtCopyDepthToColorMS;
         ShaderRecord textureDecode;
+        ShaderRecord shadowCaster;
+        ShaderRecord shadowApply;
         ShaderRecord textureCopy;
         ShaderRecord textureResolve;
         ShaderRecord videoInterfaceLinear;
         ShaderRecord videoInterfaceNearest;
         ShaderRecord videoInterfacePixel;
+        std::unique_ptr<RenderShader> shadowCutoutVertexShader;
+        std::unique_ptr<RenderShader> shadowCutoutPixelShader;
 
         ShaderLibrary(bool usesHDR, bool usesHardwareResolve);
         ~ShaderLibrary();

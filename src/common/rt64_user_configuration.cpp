@@ -25,6 +25,7 @@ namespace RT64 {
         j["threePointFiltering"] = cfg.threePointFiltering;
         j["textureFiltering"] = cfg.textureFiltering;
         j["smoothTransparency"] = cfg.smoothTransparency;
+        j["advancedLighting"] = cfg.advancedLighting;
         j["refreshRate"] = cfg.refreshRate;
         j["refreshRateTarget"] = cfg.refreshRateTarget;
         j["internalColorFormat"] = cfg.internalColorFormat;
@@ -50,6 +51,7 @@ namespace RT64 {
         cfg.threePointFiltering = j.value("threePointFiltering", defaultCfg.threePointFiltering);
         cfg.textureFiltering = j.value("textureFiltering", defaultCfg.textureFiltering);
         cfg.smoothTransparency = j.value("smoothTransparency", defaultCfg.smoothTransparency);
+        cfg.advancedLighting = j.value("advancedLighting", defaultCfg.advancedLighting);
         cfg.refreshRate = j.value("refreshRate", defaultCfg.refreshRate);
         cfg.refreshRateTarget = j.value("refreshRateTarget", defaultCfg.refreshRateTarget);
         cfg.internalColorFormat = j.value("internalColorFormat", defaultCfg.internalColorFormat);
@@ -83,6 +85,7 @@ namespace RT64 {
         threePointFiltering = true;
         textureFiltering = true;
         smoothTransparency = false;
+        advancedLighting = false;
         refreshRate = RefreshRate::Original;
         refreshRateTarget = 60;
         internalColorFormat = InternalColorFormat::Automatic;

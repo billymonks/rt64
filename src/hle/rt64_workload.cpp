@@ -22,6 +22,7 @@ namespace RT64 {
         workloadId = 0;
         extended.testZIndexCount = 0;
         extended.ditherNoiseStrength = 1.0f;
+        extended.sceneLight = SceneLight();
 
         commandWarnings.clear();
         spriteCommands.clear();
@@ -242,7 +243,7 @@ namespace RT64 {
         updateOutputBuffer(worker, outputBuffers.screenPosBuffer, vertexCount * sizeof(float) * 4, RenderBufferFlag::VERTEX);
         updateOutputBuffer(worker, outputBuffers.genTexCoordBuffer, vertexCount * sizeof(float) * 2, RenderBufferFlag::VERTEX);
         updateOutputBuffer(worker, outputBuffers.shadedColBuffer, vertexCount * sizeof(float) * 4, RenderBufferFlag::VERTEX);
-        updateOutputBuffer(worker, outputBuffers.worldPosBuffer, vertexCount * sizeof(float) * 4, rtInputFlag);
+        updateOutputBuffer(worker, outputBuffers.worldPosBuffer, vertexCount * sizeof(float) * 4, rtInputFlag | RenderBufferFlag::VERTEX);
         updateOutputBuffer(worker, outputBuffers.worldNormBuffer, vertexCount * sizeof(float) * 4);
         updateOutputBuffer(worker, outputBuffers.worldVelBuffer, vertexCount * sizeof(float) * 4);
         updateOutputBuffer(worker, outputBuffers.testZIndexBuffer, extended.testZIndexCount * sizeof(uint32_t), RenderBufferFlag::INDEX | RenderBufferFlag::STORAGE);

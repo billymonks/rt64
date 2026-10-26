@@ -798,6 +798,7 @@ namespace RT64 {
         
         // Copy the current state's extended parameters into the workload.
         workload.extended.ditherNoiseStrength = extended.ditherNoiseStrength;
+        workload.extended.sceneLight = extended.sceneLight;
 
         auto emitTileWarning = [&](CommandWarning warning, size_t tileIndex) {
             warning.indexType = CommandWarning::IndexType::TileIndex;
@@ -2732,6 +2733,10 @@ namespace RT64 {
         extended.ditherNoiseStrength = noiseStrength;
     }
     
+    void State::setSceneLight(const SceneLight &sceneLight) {
+        extended.sceneLight = sceneLight;
+    }
+
     void State::setExtendedRDRAM(bool isExtended) {
         extended.extendRDRAM = isExtended;
     }
