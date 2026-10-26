@@ -96,6 +96,8 @@ namespace RT64 {
         double extAspectTarget;
         Upscale2D upscale2D;
         bool threePointFiltering;
+        bool textureFiltering;
+        bool smoothTransparency;
         RefreshRate refreshRate;
         int refreshRateTarget;
         InternalColorFormat internalColorFormat;

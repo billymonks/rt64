@@ -23,6 +23,8 @@ namespace RT64 {
         j["extAspectTarget"] = cfg.extAspectTarget;
         j["upscale2D"] = cfg.upscale2D;
         j["threePointFiltering"] = cfg.threePointFiltering;
+        j["textureFiltering"] = cfg.textureFiltering;
+        j["smoothTransparency"] = cfg.smoothTransparency;
         j["refreshRate"] = cfg.refreshRate;
         j["refreshRateTarget"] = cfg.refreshRateTarget;
         j["internalColorFormat"] = cfg.internalColorFormat;
@@ -46,6 +48,8 @@ namespace RT64 {
         cfg.extAspectTarget = j.value("extAspectTarget", defaultCfg.extAspectTarget);
         cfg.upscale2D = j.value("upscale2D", defaultCfg.upscale2D);
         cfg.threePointFiltering = j.value("threePointFiltering", defaultCfg.threePointFiltering);
+        cfg.textureFiltering = j.value("textureFiltering", defaultCfg.textureFiltering);
+        cfg.smoothTransparency = j.value("smoothTransparency", defaultCfg.smoothTransparency);
         cfg.refreshRate = j.value("refreshRate", defaultCfg.refreshRate);
         cfg.refreshRateTarget = j.value("refreshRateTarget", defaultCfg.refreshRateTarget);
         cfg.internalColorFormat = j.value("internalColorFormat", defaultCfg.internalColorFormat);
@@ -77,6 +81,8 @@ namespace RT64 {
         extAspectTarget = 16.0f / 9.0f;
         upscale2D = Upscale2D::ScaledOnly;
         threePointFiltering = true;
+        textureFiltering = true;
+        smoothTransparency = false;
         refreshRate = RefreshRate::Original;
         refreshRateTarget = 60;
         internalColorFormat = InternalColorFormat::Automatic;

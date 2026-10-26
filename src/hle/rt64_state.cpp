@@ -753,6 +753,32 @@ namespace RT64 {
         }
     }
     
+    // Dithered alpha compare keeps or drops each pixel at random. A CRT blends that
+    // into transparency; a sample-and-hold display shows it as flicker. Replace it
+    // with a normal alpha blend and stop those pixels from writing depth.
+    static void applySmoothTransparency(interop::OtherMode &otherMode) {
+        if (otherMode.alphaCompare() != G_AC_DITHER) {
+            return;
+        }
+
+        const uint32_t cycleType = otherMode.cycleType();
+        if ((cycleType != G_CYC_1CYCLE) && (cycleType != G_CYC_2CYCLE)) {
+            return;
+        }
+
+        otherMode.L &= ~uint32_t(G_AC_DITHER);
+        if (interop::Blender::usesAlphaBlend(otherMode)) {
+            return;
+        }
+
+        constexpr uint32_t BlenderMask = 0xFFFF0000u;
+        constexpr uint32_t XluBlender = (1u << 22) | (1u << 20);
+        otherMode.L = (otherMode.L & ~BlenderMask) | XluBlender;
+        otherMode.L |= FORCE_BL;
+        otherMode.L &= ~uint32_t(Z_UPD);
+        otherMode.L = (otherMode.L & ~uint32_t(ZMODE_MASK)) | ZMODE_XLU;
+    }
+
     void State::fullSync() {
         flush();
         submitFramebufferPair(FramebufferPair::FlushReason::ProcessDisplayListsEnd);
@@ -783,7 +809,8 @@ namespace RT64 {
         const bool extendedRenderToRAMSet = (extended.renderToRAM < UINT8_MAX);
         const bool renderToRDRAM = extendedRenderToRAMSet ? (extended.renderToRAM != 0) : ext.emulatorConfig->framebuffer.renderToRAM;
         const bool warningsEnabled = ext.userConfig->developerMode;
-        const bool linearFiltering = !ext.userConfig->threePointFiltering;
+        const bool textureFiltering = ext.userConfig->textureFiltering;
+        const bool linearFiltering = textureFiltering && !ext.userConfig->threePointFiltering;
         const size_t callTileCount = workload.drawData.callTiles.size();
         for (size_t t = 0; t < callTileCount; t++) {
             DrawCallTile &callTile = workload.drawData.callTiles[t];
@@ -939,11 +966,17 @@ namespace RT64 {
 
                     shaderDesc.colorCombiner = callDesc.colorCombiner;
                     shaderDesc.otherMode = callDesc.otherMode;
+                    if (!textureFiltering) {
+                        shaderDesc.otherMode.H &= ~(3U << G_MDSFT_TEXTFILT);
+                    }
+                    if (ext.userConfig->smoothTransparency) {
+                        applySmoothTransparency(shaderDesc.otherMode);
+                    }
                     shaderDesc.flags = {};
 
                     // Check if the blender uses a standard fog cycle. We override it and indicate it on
                     // the material for the RT path to use its own fog handling.
-                    interop::Blender::EmulationRequirements blenderEmuReqs = interop::Blender::checkEmulationRequirements(callDesc.otherMode);
+                    interop::Blender::EmulationRequirements blenderEmuReqs = interop::Blender::checkEmulationRequirements(shaderDesc.otherMode);
 #               ifdef ASSERT_ON_BLENDER_EMULATION
                     assert(blenderEmuReqs.simpleEmulation || (blenderEmuReqs.approximateEmulation != interop::Blender::Approximation::None));
 #               endif
@@ -962,7 +995,7 @@ namespace RT64 {
                     const bool oneCycleHardwareBug = (callDesc.otherMode.cycleType() == G_CYC_1CYCLE);
                     auto &flags = shaderDesc.flags;
                     flags.rect = (proj.type == Projection::Type::Rectangle);
-                    flags.linearFiltering = linearFiltering || forceLinearFiltering;
+                    flags.linearFiltering = linearFiltering || (textureFiltering && forceLinearFiltering);
                     flags.usesTexture0 = callDesc.colorCombiner.usesTexture(callDesc.otherMode, 0, oneCycleHardwareBug);
                     flags.usesTexture1 = callDesc.colorCombiner.usesTexture(callDesc.otherMode, 1, oneCycleHardwareBug);
                     flags.blenderApproximation = static_cast<unsigned>(blenderEmuReqs.approximateEmulation);
@@ -1007,7 +1040,13 @@ namespace RT64 {
 
                         // If the shader uses LOD, we check if all tiles use the same addressing mode as the first tile so it
                         // can be optimized to not rely on branching to determine how to sample the textures.
-                        const auto &rdpTiles = workload.drawData.rdpTiles;
+                        auto &rdpTiles = workload.drawData.rdpTiles;
+                        // Native samplers take a hardware linear path for mipmaps, which ignores the RDP filter mode.
+                        if (!textureFiltering) {
+                            for (uint32_t t = 0; t < callDesc.tileCount; t++) {
+                                rdpTiles[callDesc.tileIndex + t].nativeSampler = NATIVE_SAMPLER_NONE;
+                            }
+                        }
                         const interop::RDPTile &tile0 = rdpTiles[callDesc.tileIndex];
                         if (usesLOD && (callDesc.tileCount > 1)) {
                             bool sameModes = true;
