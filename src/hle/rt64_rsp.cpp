@@ -351,6 +351,7 @@ namespace RT64 {
             return;
         }
 
+        lastVertexAddress = address;
         const uint32_t rdramAddress = fromSegmentedMasked(address);
         const Vertex *dlVerts = reinterpret_cast<const Vertex *>(state->fromRDRAM(rdramAddress));
         memcpy(&vertices[dstIndex], dlVerts, sizeof(Vertex) * vtxCount);
@@ -363,6 +364,7 @@ namespace RT64 {
             return;
         }
 
+        lastVertexAddress = address;
         const uint32_t rdramAddress = fromSegmentedMaskedPD(address);
         const VertexPD *dlVerts = reinterpret_cast<const VertexPD *>(state->fromRDRAM(rdramAddress));
         for (uint32_t i = 0; i < vtxCount; i++) {
@@ -389,6 +391,7 @@ namespace RT64 {
             return;
         }
 
+        lastVertexAddress = address;
         const int workloadCursor = state->ext.workloadQueue->writeCursor;
         Workload &workload = state->ext.workloadQueue->workloads[workloadCursor];
         const uint32_t rdramAddress = fromSegmentedMasked(address);
@@ -1105,6 +1108,10 @@ namespace RT64 {
                     fbPair.drawDepthRect.merge(drawRect);
                 }
             }
+        }
+
+        if (drawCall.triangleCount == 0) {
+            drawCall.vertexAddress = lastVertexAddress;
         }
 
         drawCall.triangleCount++;

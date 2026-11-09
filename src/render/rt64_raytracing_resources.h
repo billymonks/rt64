@@ -5,6 +5,9 @@
 #pragma once
 
 #include <memory>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "common/rt64_common.h"
@@ -12,6 +15,7 @@
 #include "common/rt64_user_configuration.h"
 #include "preset/rt64_preset_scene.h"
 #include "render/rt64_buffer_uploader.h"
+#include "render/rt64_raytracing_materials.h"
 #include "render/rt64_upscaler.h"
 #include "shared/rt64_interleaved_raster.h"
 #include "shared/rt64_point_light.h"
@@ -22,6 +26,13 @@ namespace RT64 {
     struct RenderTarget;
     struct RenderFramebufferStorage;
     struct ShaderLibrary;
+
+    // Upscaler of the ray traced image chosen in the Graphics menu.
+    enum class RaytracingUpscaler : uint32_t {
+        Off = 0,
+        FSR1 = 1,
+        FSR3 = 2
+    };
 
     struct RaytracingConfiguration {
         int diSamples = 1;
@@ -45,6 +56,23 @@ namespace RT64 {
     // camera facing billboards are replaced by light facing proxies.
     static const uint32_t RtCameraRayMask = 0x1;
     static const uint32_t RtShadowRayMask = 0x2;
+    // Water surfaces (Advanced Water Rendering): only the water pass's camera rays see them.
+    static const uint32_t RtWaterRayMask = 0x4;
+    // Decals (decal depth mode): only the camera ray's decal query sees them, never camera, bounce or shadow rays.
+    static const uint32_t RtDecalRayMask = 0x8;
+    // Flags in the high bits of a draw's gRtMaterials word (above the material class): the water pass shades this path
+    // traced draw as water, and (for water found by its scrolling texture) only where its color is blue or blue-green.
+    static const uint32_t RtMaterialWaterPassFlag = 1u << 28;
+    static const uint32_t RtMaterialWaterHueGateFlag = 1u << 29;
+    // A decal draw (decal depth mode), path traced on top of the surface it lies on; and one that is alpha blended, so its
+    // camera hits blend its color over that surface's by its alpha.
+    static const uint32_t RtMaterialDecalFlag = 1u << 30;
+    static const uint32_t RtMaterialDecalBlendFlag = 1u << 31;
+    // Large path traced draws (scenery rather than characters or small objects), which take decals drawn before them.
+    // It replaces the top bit of the material class, which the shaders don't read.
+    static const uint32_t RtMaterialSceneryFlag = 1u << 27;
+    // Largest learned offset of a decal from its surface (kDecalMaxOffset in RtLibrary.hlsl).
+    static const float RtDecalMaxOffset = 16.0f;
 
     struct RaytracingInstance {
         // Index into the frame's RenderIndices, used as the instance ID so hit shaders can find the draw's material.
@@ -56,6 +84,54 @@ namespace RT64 {
         bool proxy = false;
         uint32_t queryMask = 0xFF;
         bool cullDisable = true;
+    };
+
+    // How a candidate light source is drawn. The GPU applies a different color test to each (see emissiveGlow in
+    // RtLibrary.hlsl): additive sprites glow when bright, blended ones when bright and saturated, and small cutout
+    // sprites only when bright, saturated and warm like a flame.
+    enum class EmissiveCategory : uint32_t {
+        Additive = 0,
+        Blended = 1,
+        Cutout = 2
+    };
+
+    // A piece of an effect sprite drawn in the 3D view (flames, spell effects) that may emit light.
+    struct EmissiveCandidate {
+        float center[3] = {};
+        float extent = 0.0f;
+        uint32_t renderIndex = 0;
+        uint32_t triangleCount = 0;
+        uint64_t key = 0;
+        EmissiveCategory category = EmissiveCategory::Blended;
+        // A long, narrow strip. Thin pieces never merge into clusters, and rings of them are rejected.
+        bool thin = false;
+        // An untextured effect (hit sparks), keyed by its combiner and primitive color.
+        bool untextured = false;
+        // The draw the piece comes from, matched against rt_emitters.json.
+        RtEmitterSignature signature;
+    };
+
+    struct EmissiveRejections {
+        uint32_t groundFlat = 0;
+        uint32_t tooLarge = 0;
+        uint32_t tooSmall = 0;
+        uint32_t clusterTooLarge = 0;
+        uint32_t thinLinePieces = 0;
+        uint32_t untexturedDraws = 0;
+        // Cutout draws lit with vertex normals: model parts, never flames.
+        uint32_t litCutouts = 0;
+    };
+
+    // Details of a candidate draw for the diagnostics log.
+    struct EmissiveDrawInfo {
+        uint64_t key = 0;
+        EmissiveCategory category = EmissiveCategory::Blended;
+        uint32_t triangleCount = 0;
+        uint32_t pieces = 0;
+        uint32_t thinPieces = 0;
+        uint32_t accepted = 0;
+        float maxAspect = 0.0f;
+        float maxExtent = 0.0f;
     };
 
     struct RaytracingScene {
@@ -76,9 +152,92 @@ namespace RT64 {
         uint32_t drawsCulling = 0;
         uint32_t incompatibleProjections = 0;
         uint32_t skippedLayeredDraws = 0;
+        // Decal depth mode draws: path traced, kept rasterized after because their world positions don't match the
+        // raster's or they're additive, and all decals rasterized after (also the ones through another camera).
+        uint32_t decalsTraced = 0;
+        uint32_t decalsWorldMismatch = 0;
+        uint32_t decalsAdditive = 0;
+        uint32_t decalsRasterAfter = 0;
+        // Decals rasterized after because an earlier capture found the tie-break couldn't show them.
+        uint32_t decalsFallback = 0;
+        // The path traced decals of the frame, for the F9 log (capped).
+        struct DecalInfo {
+            uint64_t key;
+            uint64_t id;
+            uint32_t renderIndex;
+            uint32_t triangles;
+            float extent;
+            bool blended;
+            bool alphaTested;
+            bool culling;
+            uint32_t queryMask;
+            uint32_t combiner[2];
+            float primAlpha;
+            float envAlpha;
+        };
+        std::vector<DecalInfo> decalInfos;
         uint32_t billboardsCylindrical = 0;
         uint32_t billboardsSpherical = 0;
         uint32_t billboardProxies = 0;
+
+        std::vector<EmissiveCandidate> emissiveCandidates;
+        uint32_t emissiveCandidateDraws = 0;
+        EmissiveRejections emissiveRejections;
+        std::vector<EmissiveDrawInfo> emissiveDrawInfos;
+        uint32_t emissiveUntexturedAdditiveDraws = 0;
+        uint32_t emissiveDepthWritingAdditiveDraws = 0;
+        // Opaque 3D draws outside the path traced scene that only cast shadows.
+        uint32_t shadowOnlyCasters = 0;
+        // Water surfaces shaded by the water pass (Advanced Water Rendering): blended ones it ray traces instead of
+        // rasterizing after the path traced pass, and path traced (opaque) ones it shades on top.
+        struct WaterDraw {
+            uint64_t key;
+            uint32_t renderIndex;
+            uint32_t triangles;
+            float extent;
+            float upFacing;
+            // "listed" (rt_materials.json class water) or "detected" (flat, wide, alpha blended, no depth write).
+            const char *source;
+        };
+        std::vector<WaterDraw> waterDraws;
+        // Draws that looked like water but were left alone: a red tint (lava) or a material entry of another class.
+        uint32_t waterRejected = 0;
+        // Why some large flat draws were not taken as water, for the F9 log (capped).
+        struct WaterReject {
+            uint64_t key;
+            uint32_t renderIndex;
+            float extent;
+            const char *reason;
+        };
+        std::vector<WaterReject> waterRejects;
+        // Textures to sample this frame for material guesses, and the texture key of each path traced draw by render
+        // index (0 when untextured or not path traced).
+        std::vector<RtMaterialProbe> materialProbes;
+        std::vector<uint64_t> materialKeys;
+        // 3D draws kept out of the path traced scene because their world positions don't project to where the raster
+        // drew them (a failed world matrix split), with a few examples for the log.
+        uint32_t drawsWorldMismatch = 0;
+        struct WorldMismatch {
+            uint32_t renderIndex;
+            uint64_t texture;
+            uint32_t vertexAddress;
+            uint32_t triangles;
+            float error;
+        };
+        std::vector<WorldMismatch> worldMismatchSamples;
+        // Draw signature of each textured path traced draw by render index, for the F9 "center draw" line.
+        std::vector<RtEmitterSignature> drawSignatures;
+        struct MaterialPreview {
+            uint64_t key;
+            RenderTexture *texture;
+            uint32_t width;
+            uint32_t height;
+        };
+        std::vector<MaterialPreview> materialPreviews;
+        // Where the game is (see SceneLight), for the emitter area filters and "first seen" notes.
+        int areaMap = -1;
+        int areaRoom = -1;
+        const char *areaName = "";
         interop::float4x4 curViewMatrix;
         interop::float4x4 curProjMatrix;
         interop::float4x4 prevViewMatrix;
@@ -109,6 +268,8 @@ namespace RT64 {
         BufferPair rtParamsBuffer;
 
         bool swapBuffers = false;
+        interop::float4x4 previousViewProj;
+        bool previousViewProjValid = false;
         bool skipReprojection = false;
         bool denoiserEnabled = true;
         bool upscaleActive = false;
@@ -118,8 +279,72 @@ namespace RT64 {
         bool updateOutputBuffers = true;
         UpscaleMode upscalerMode = UpscaleMode::Bilinear;
         int maxReflections = 0;
+        // Ray tracing resolution. It's below the display resolution while an upscaler is active.
         uint32_t textureWidth = 1;
         uint32_t textureHeight = 1;
+        uint32_t displayWidth = 1;
+        uint32_t displayHeight = 1;
+
+        // Upscaling of the ray traced image (Graphics menu "Upscaler"), see rt64_raytracing_upscale.cpp.
+        RenderShaderFormat shaderFormat = RenderShaderFormat::UNKNOWN;
+        const ShaderLibrary *shaderLibrary = nullptr;
+        std::unique_ptr<Upscaler> fsr1Upscaler;
+        std::unique_ptr<Upscaler> fsr3Upscaler;
+        Upscaler *activeUpscaler = nullptr;
+        RaytracingUpscaler requestedUpscaler = RaytracingUpscaler::Off;
+        RaytracingUpscaler activeUpscalerKind = RaytracingUpscaler::Off;
+        RaytracingUpscaler previousUpscalerKind = RaytracingUpscaler::Off;
+        Upscaler::QualityMode upscalerQuality = Upscaler::QualityMode::Quality;
+        float upscalerSharpness = 0.5f;
+        bool fsr3Unavailable = false;
+        bool fsr3FallbackLogged = false;
+        std::string fsr3FailureReason;
+        bool upscalerResetPending = true;
+        bool upscalerResetThisFrame = false;
+        uint32_t upscalerResets = 0;
+        uint64_t lastRaytracedFrame = 0;
+        bool lastRaytracedFrameValid = false;
+        float lastCameraOrigin[3] = {};
+        float lastCameraForward[3] = {};
+        bool lastCameraValid = false;
+        // Near and far planes of the game's projection (rtParams.nearDist and farDist are repurposed).
+        float cameraNearPlane = 1.0f;
+        float cameraFarPlane = 1000.0f;
+        int jitterPhaseCount = 1;
+        int jitterIndex = 0;
+        std::unique_ptr<RenderTexture> motionVectorTexture;
+        std::unique_ptr<RenderTexture> deviceDepthTexture;
+        std::unique_ptr<struct UpscalerInputsDescriptorSet> upscalerInputsSet;
+        std::unique_ptr<RenderPipelineLayout> upscalerInputsPipelineLayout;
+        std::unique_ptr<RenderPipeline> upscalerInputsPipeline;
+        bool upscalerInputsPipelineCreated = false;
+
+        // GPU time of each ray tracing pass, averaged. Timestamps go through a ring of query pools so each is read a
+        // few frames after it was written.
+        enum class PassTimestamp : uint32_t {
+            Start,
+            Primary,
+            Emissive,
+            Direct,
+            Indirect,
+            Refraction,
+            Reflection,
+            Compose,
+            Upscale,
+            Post,
+            Count
+        };
+
+        static const uint32_t PassTimingDepth = 3;
+        static const uint32_t PassCount = uint32_t(PassTimestamp::Count) - 1;
+        std::unique_ptr<RenderQueryPool> passQueryPools[PassTimingDepth];
+        bool passQueryWritten[PassTimingDepth] = {};
+        uint32_t passQueryBounces[PassTimingDepth] = {};
+        uint32_t passQueryFrame = 0;
+        RenderQueryPool *activePassQueryPool = nullptr;
+        uint32_t activePassQuerySlot = 0;
+        float passMs[PassCount] = {};
+        float totalPassMs = 0.0f;
 
         std::unique_ptr<RenderTexture> viewDirectionTexture;
         std::unique_ptr<RenderTexture> shadingPositionTexture;
@@ -225,6 +450,135 @@ namespace RT64 {
         std::vector<std::unique_ptr<RenderTarget>> interleavedDepthTargetVector;
         std::vector<std::unique_ptr<RenderFramebufferStorage>> interleavedFramebufferStorageVector;
 
+        // Emissive point lights. Clusters of candidate sprites are tracked across frames so each light keeps its slot
+        // (which indexes its smoothed color on the GPU) and its position can be smoothed.
+        static const uint32_t MaxEmissiveLights = 32;
+        // Manual point lights (rt_lights.json) used per area, on top of the emissive lights.
+        static const uint32_t MaxManualLights = 16;
+        std::vector<std::string> frameManualLightIds;
+        // The room's sun and moon setting (rt_lights.json "room settings") last frame and where it came from.
+        int32_t lastSunDisabled = -1;
+        uint32_t lastIndirectBounces = 0;
+        // Decals (by texture, vertex load and size) that three decal checks in a row saw mostly missed: rasterized after
+        // the path traced pass, by the frame they fell back on, and tried again after a while. Each decal's learned
+        // offset from its surface (normal distance, up to 16 units) and its count of bad checks in a row.
+        std::unordered_map<uint64_t, uint32_t> decalRasterFallback;
+        std::unordered_map<uint64_t, float> decalOffsets;
+        std::unordered_map<uint64_t, uint8_t> decalBadChecks;
+        static const uint32_t DecalFallbackRetryFrames = 1800;
+        // The decals whose camera hits the last capture counted (RtParams.diagDecal0-5).
+        static const uint32_t DiagDecalSlots = 6;
+        RaytracingScene::DecalInfo diagDecals[DiagDecalSlots] = {};
+        uint32_t diagDecalCount = 0;
+        // Decal check: every few seconds the camera hits of a few decals are counted and read back (counters only).
+        std::unique_ptr<RenderBuffer> decalCheckReadback;
+        int32_t decalCheckDelay = -1;
+        uint32_t decalCheckCursor = 0;
+        bool decalCheckThisFrame = false;
+        // GPU time of the indirect light pass, averaged, with 1 and with 2 bounces. Timestamps go through a ring of
+        // query pools so each is read a few frames after it was written.
+        static const uint32_t IndirectTimingDepth = 3;
+        std::unique_ptr<RenderQueryPool> indirectQueryPools[IndirectTimingDepth];
+        bool indirectQueryWritten[IndirectTimingDepth] = {};
+        uint32_t indirectQueryBounces[IndirectTimingDepth] = {};
+        uint32_t indirectQueryFrame = 0;
+        float indirectPassMs[2] = {};
+        const char *sunSettingSource = "default";
+        const char *sunSettingScope = "no entry";
+        bool manualLightCapLogged = false;
+        static const uint32_t EmissiveSlots = 64;
+        // Lights fade in and out instead of popping: fade rises while the source is seen and falls once it's gone, so a
+        // light outlives its source by a few frames.
+        struct TrackedEmissive {
+            float position[3] = {};
+            float extent = 0.0f;
+            float fade = 0.0f;
+            uint64_t key = 0;
+            uint32_t slot = 0;
+            uint32_t renderIndex = 0;
+            uint32_t triangleCount = 0;
+            EmissiveCategory category = EmissiveCategory::Blended;
+            bool fresh = true;
+            bool seen = false;
+            bool suppressed = false;
+            bool keyChanged = false;
+            // From an untextured effect (hit sparks): a brief, modest flash.
+            bool untextured = false;
+            // The rt_emitters.json entry the light comes from.
+            RtEmitterParams params;
+        };
+        std::vector<TrackedEmissive> trackedEmissives;
+        std::vector<interop::PointLight> frameLights;
+
+        // What the GPU found each source's color to be, by key, from earlier frames. Sources it keeps rejecting
+        // (dark, dust-like, not flame colored) stop taking light slots, and get sampled again now and then.
+        struct EmissiveVerdict {
+            float glow = 0.0f;
+            uint32_t samples = 0;
+            uint32_t lastSampledFrame = 0;
+            uint32_t lastSeenFrame = 0;
+            bool rejected = false;
+            // Detected as a piece of a ground ring (the battle circle): never a light.
+            bool ring = false;
+            // Highest glow seen, decaying slowly, and the run of dark samples. A source that has clearly emitted is
+            // not demoted by a few dark samples (a faint animation frame, a sample on a transparent texel).
+            float peakGlow = 0.0f;
+            uint32_t darkStreak = 0;
+            // Cool colored (water, mist) in its last sample, the frame since which it has been on screen without a
+            // break, and whether it has stayed on screen long enough to be scenery rather than a spell.
+            bool coolTint = false;
+            uint32_t visibleSince = 0;
+            bool persistent = false;
+        };
+        std::unordered_map<uint64_t, EmissiveVerdict> emissiveVerdicts;
+        uint32_t emissiveFrame = 0;
+        uint32_t emissiveVerdictRejections = 0;
+        uint32_t emissivePersistentRejections = 0;
+        // Candidate pieces whose texture isn't listed in rt_emitters.json, or is listed but disabled or filtered out.
+        uint32_t emissiveUnlistedPieces = 0;
+        uint32_t emissiveDisabledPieces = 0;
+        // Unlisted untextured pieces lit by the legacy glow.
+        uint32_t emissiveLegacyPieces = 0;
+        uint32_t emissiveRingKeys = 0;
+        uint32_t emissiveRingKeyPieces = 0;
+
+        // The glow of every light slot is read back a few frames later, with the key each slot held when it was sampled.
+        static const uint32_t EmissiveReadbackDepth = 3;
+        std::unique_ptr<RenderBuffer> emissiveReadback[EmissiveReadbackDepth];
+        uint64_t emissiveReadbackKeys[EmissiveReadbackDepth][EmissiveSlots] = {};
+        bool emissiveReadbackSampled[EmissiveReadbackDepth][EmissiveSlots] = {};
+        bool emissiveReadbackPending[EmissiveReadbackDepth] = {};
+        uint32_t emissiveCopyRingIndex = 0;
+        uint64_t emissiveSlotKeys[EmissiveSlots] = {};
+        bool emissiveSlotSampled[EmissiveSlots] = {};
+        uint32_t emissiveClusterCount = 0;
+        uint32_t emissiveClustersTooLarge = 0;
+        uint32_t emissiveRingPieces = 0;
+        uint32_t emissiveRings = 0;
+
+        // Texture probes for material guesses: sampled by the emissive color dispatch into gHitNormalFog after the
+        // emissive slots (two float4 per probe), and read back with the glow.
+        static const uint32_t MaterialProbeSlots = 16;
+        static const uint32_t HitNormalFogEntries = EmissiveSlots * 2 + MaterialProbeSlots * 2;
+        std::vector<RtMaterialProbe> materialProbeRing[EmissiveReadbackDepth];
+        std::vector<RtMaterialProbe> frameMaterialProbes;
+        uint32_t materialGuessesThisSession = 0;
+        // Texture key of each path traced draw by render index, this frame and as of the last diagnostics copy.
+        std::vector<uint64_t> frameMaterialKeys;
+        std::vector<uint64_t> diagMaterialKeys;
+        std::vector<RtEmitterSignature> frameDrawSignatures;
+        std::vector<RtEmitterSignature> diagDrawSignatures;
+        // Texture previews being read back from the GPU for the material file.
+        struct PendingMaterialPreview {
+            uint64_t key = 0;
+            uint32_t width = 0;
+            uint32_t height = 0;
+            uint32_t rowWidth = 0;
+            uint32_t frame = 0;
+            std::unique_ptr<RenderBuffer> readback;
+        };
+        std::vector<PendingMaterialPreview> pendingMaterialPreviews;
+
         // Diagnostics written to rt.log. The primary ray shader counts rays into hitInstanceIdBuffer
         // and writes probe values into hitColorBuffer; both are copied to diagReadback on a few frames.
         uint32_t diagFrame = 0;
@@ -248,9 +602,26 @@ namespace RT64 {
         void setShaderReadBuffers(RenderBuffer *normalBuffer, RenderBuffer *shadedColorBuffer);
         void prepareForDispatch(RenderWorker *worker);
         void createShaderBindingTable(RenderWorker *worker, const struct RaytracingState *rtState, RenderDescriptorSet **descriptorSets, uint32_t descriptorSetCount, const std::vector<RenderPipelineProgram> &hitGroups);
-        void updateLightsBuffer(RenderWorker *worker, const RaytracingScene &rtScene);
+        void updateLightsBuffer(RenderWorker *worker);
+        void updateEmissiveLights(const RaytracingScene &rtScene, const float cameraPosition[3]);
+        void updateMaterialProbes(const RaytracingScene &rtScene);
+        void copyMaterialPreviews(RenderWorker *worker, const RaytracingScene &rtScene);
+        void readMaterialPreviews();
+        void copyEmissiveGlow(RenderWorker *worker);
+        void readEmissiveGlow();
+        bool emissiveKeyRejected(uint64_t key) const;
+        bool emissiveKeySuppressed(uint64_t key) const;
+        float emissiveKeyGlow(uint64_t key) const;
         void setRaytracingConfig(const RaytracingConfiguration &rtConfig, bool resolutionChanged);
-        void createOutputBuffers(RenderWorker *worker, uint32_t width, uint32_t height);
+        void createOutputBuffers(RenderWorker *worker, uint32_t width, uint32_t height, uint32_t displayWidth, uint32_t displayHeight);
+        void resolveUpscaler(RenderWorker *worker, uint32_t displayWidth, uint32_t displayHeight, uint32_t &renderWidth, uint32_t &renderHeight);
+        void updateUpscalerFrame(uint64_t frameCount);
+        void submitUpscale(RenderWorker *worker, float deltaTimeMs);
+        void submitUpscalerInputs(RenderWorker *worker);
+        void beginPassTiming(RenderWorker *worker);
+        void writePassTimestamp(RenderWorker *worker, PassTimestamp timestamp);
+        void endPassTiming();
+        void logUpscalerDiagnostics();
         void updateInterleavedRenderTargets(RenderWorker *worker, uint32_t width, uint32_t height, uint32_t count, const RenderMultisampling &multisampling, bool usesHDR);
         void updateShaderSets(RenderWorker *worker, const ShaderLibrary *shaderLibrary);
         void updateMultisampling();
@@ -258,9 +629,29 @@ namespace RT64 {
         void logSceneDiagnostics(const RaytracingScene &rtScene);
         void clearDiagnosticBuffers(RenderWorker *worker);
         void copyDiagnosticBuffers(RenderWorker *worker);
+        void assignDecalSlots(const RaytracingScene &rtScene, bool rotate);
+        void evaluateDecalSlots(const uint32_t *counters, bool log);
+        void copyDecalCheckCounters(RenderWorker *worker);
+        void readDecalCheckCounters();
         void copyDiagnosticTextures(RenderWorker *worker, RenderTexture *finalColor, RenderFormat finalColorFormat, RenderTextureLayout finalColorLayout, uint32_t finalX, uint32_t finalY);
         void readDiagnosticBuffers();
     };
 
     void rtDiagLog(const char *fmt, ...);
+
+    // Asks the renderer to write a full diagnostics dump, including every 3D draw that isn't path traced, for the next
+    // ray traced frame. Safe to call from any thread (the game binds it to F9).
+    void requestRaytracingDiagnosticsCapture();
+    void cycleRaytracingDebugView();
+    uint32_t raytracingDebugView();
+    void setRaytracingIndirectBounces(uint32_t bounces);
+    void setRaytracingAdvancedWater(bool enabled);
+    bool raytracingAdvancedWater();
+    void toggleRaytracingSecondBounce();
+    uint32_t raytracingIndirectBounces();
+    bool raytracingDiagnosticsCaptureRequested();
+    bool consumeRaytracingDiagnosticsCapture();
+    // Graphics menu "Upscaler", "Quality" and "Sharpness": mode is a RaytracingUpscaler, quality is 0 (Native AA),
+    // 1 (Quality), 2 (Balanced), 3 (Performance) or 4 (Ultra Performance), sharpness is from 0 to 1.
+    void setRaytracingUpscaler(uint32_t mode, uint32_t quality, float sharpness);
 };

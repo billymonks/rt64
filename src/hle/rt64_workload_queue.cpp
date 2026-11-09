@@ -977,7 +977,7 @@ namespace RT64 {
 
                 float prevFrameWeight = 0.0f;
                 float curFrameWeight = 1.0f;
-                float deltaTimeMs = 1.0f / 30.0f;
+                float deltaTimeMs = 1000.0f / 30.0f;
                 const bool requiresFrameMatching = (workloadConfig.targetRate > 0) || workloadConfig.raytracingEnabled;
                 bool generateInterpolatedFrames = false;
                 bool velocityUploaderUsed = false;
@@ -1007,7 +1007,7 @@ namespace RT64 {
                 if (generateInterpolatedFrames) {
                     logicalTicks += workloadConfig.targetRate;
                     displayFrames = uint32_t((logicalTicks - displayTicks) / workload.viOriginalRate);
-                    deltaTimeMs = 1.0f / float(workloadConfig.targetRate);
+                    deltaTimeMs = 1000.0f / float(workloadConfig.targetRate);
 
                     if ((displayFrames > 1) && frameReduction) {
                         displayTicks += workload.viOriginalRate;
@@ -1020,7 +1020,7 @@ namespace RT64 {
                     assert((displayFrames > 0) && "At least one display frame must be generated.");
                 }
                 else if (workload.viOriginalRate > 0) {
-                    deltaTimeMs = 1.0f / float(workload.viOriginalRate);
+                    deltaTimeMs = 1000.0f / float(workload.viOriginalRate);
                 }
 
                 ext.sharedResources->viOriginalRate = workload.viOriginalRate;

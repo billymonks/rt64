@@ -24,7 +24,8 @@ namespace RT64 {
         Bilinear,
         FSR,
         DLSS,
-        XeSS
+        XeSS,
+        FSR1
     };
 
     static const unsigned int DepthRayQueryMask = 0x1;

@@ -117,6 +117,10 @@ namespace RT64 {
         // Debugging parameters.
         uint32_t drawStatusChanges;
 
+        // Segmented address of the vertex load (G_VTX) the call's first triangle used: identifies the model or effect
+        // the polygons come from, for the ray traced emitter list.
+        uint32_t vertexAddress;
+
         static std::string attributeName(DrawAttribute attribute);
         bool identityRectScale() const;
     };

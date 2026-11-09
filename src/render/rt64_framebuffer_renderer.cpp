@@ -18,6 +18,7 @@
 #include "rt64_render_worker.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cfloat>
@@ -328,6 +329,47 @@ namespace RT64 {
         const float expectedW = drawData.posTransformed[sampleVertex][3];
         camera.valid = std::fabs(w - expectedW) <= (std::fabs(expectedW) * 0.01f + 0.01f);
         return camera;
+    }
+
+    // Whether a draw's world space positions (its vertices times the world matrix RT64 split off the game's modelview)
+    // project to where the RSP really drew them. When the split fails for a draw (some character parts, like pieces of
+    // Brian's cape), its "world" positions are still in model space: in the path traced scene its triangles would sit
+    // at the wrong place, facing an axis, and leak light. Such draws stay rasterized. Returns the largest error found.
+    static bool worldMatchesRaster(const DrawData &drawData, uint32_t indexStart, uint32_t indexCount, float &largestError) {
+        const uint32_t MaxSamples = 8;
+        largestError = 0.0f;
+        if ((indexCount == 0) || (indexStart + indexCount > drawData.faceIndices.size())) {
+            return true;
+        }
+
+        const uint32_t step = std::max(indexCount / MaxSamples, 1u);
+        bool matches = true;
+        for (uint32_t i = 0; i < indexCount; i += step) {
+            const uint32_t vertex = drawData.faceIndices[indexStart + i];
+            if ((vertex >= drawData.viewProjIndices.size()) || (vertex >= drawData.posTransformed.size())) {
+                continue;
+            }
+
+            const uint16_t viewProjIndex = drawData.viewProjIndices[vertex];
+            const interop::float4x4 *transform = nullptr;
+            float world[3];
+            if ((viewProjIndex >= drawData.viewProjTransforms.size()) || !scenePosition(drawData, vertex, world[0], world[1], world[2], transform)) {
+                continue;
+            }
+
+            const interop::float4x4 &vp = drawData.viewProjTransforms[viewProjIndex];
+            const float expectedW = std::fabs(float(drawData.posTransformed[vertex][3]));
+            for (int c = 0; c < 4; c++) {
+                const float clip = world[0] * vp.m[0][c] + world[1] * vp.m[1][c] + world[2] * vp.m[2][c] + vp.m[3][c];
+                const float error = std::fabs(clip - float(drawData.posTransformed[vertex][c]));
+                largestError = std::max(largestError, error / (expectedW + 1.0f));
+                if (!(error <= (expectedW * 0.01f + 0.5f))) {
+                    matches = false;
+                }
+            }
+        }
+
+        return matches;
     }
 
     // Splits a draw into pieces of triangles connected by shared vertices or shared positions, since a single
@@ -696,6 +738,380 @@ namespace RT64 {
         return true;
     }
 
+    // True when a blender cycle adds the color to the framebuffer (memory color times one), as glows and flames do.
+    static bool usesAdditiveBlend(const interop::OtherMode &otherMode) {
+        const uint32_t cycles = interop::Blender::blendCycleCount(otherMode);
+        const uint32_t blenderInputs = otherMode.blenderInputs();
+        for (uint32_t c = 0; c < cycles; c++) {
+            const bool secondCycle = (c > 0);
+            if ((interop::Blender::decodeInputM(blenderInputs, secondCycle) == interop::Blender::PM_FRAMEBUFFER_COLOR) &&
+                (interop::Blender::decodeInputB(blenderInputs, secondCycle) == interop::Blender::B_ONE))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // The signature of a draw for rt_emitters.json: its texture, vertex load, combiner, render mode, colors and size.
+    static RtEmitterSignature drawSignature(const DrawData &drawData, const GameCall &call, uint64_t textureKey, uint32_t kind) {
+        RtEmitterSignature signature;
+        signature.texture = textureKey;
+        signature.vertexAddress = call.callDesc.vertexAddress;
+        signature.combiner[0] = call.shaderDesc.colorCombiner.L;
+        signature.combiner[1] = call.shaderDesc.colorCombiner.H;
+        signature.otherMode[0] = call.shaderDesc.otherMode.L;
+        signature.otherMode[1] = call.shaderDesc.otherMode.H;
+        if (call.callDesc.callIndex < drawData.rdpParams.size()) {
+            const interop::RDPParams &rdp = drawData.rdpParams[call.callDesc.callIndex];
+            const float prim[4] = { rdp.primColor.x, rdp.primColor.y, rdp.primColor.z, rdp.primColor.w };
+            const float env[4] = { rdp.envColor.x, rdp.envColor.y, rdp.envColor.z, rdp.envColor.w };
+            for (int c = 0; c < 4; c++) {
+                signature.prim[c] = std::clamp(prim[c], 0.0f, 1.0f);
+                signature.env[c] = std::clamp(env[c], 0.0f, 1.0f);
+            }
+        }
+
+        // Average color of the unlit vertices (lit vertices store normals there instead).
+        const uint32_t indexCount = std::min(call.callDesc.triangleCount * 3, 96u);
+        float colorSum[3] = {};
+        uint32_t colorCount = 0;
+        for (uint32_t i = 0; i < indexCount; i++) {
+            const uint32_t index = call.meshDesc.faceIndicesStart + i;
+            if (index >= drawData.faceIndices.size()) {
+                break;
+            }
+
+            const uint32_t vertex = drawData.faceIndices[index];
+            const bool lit = (vertex < drawData.lightCounts.size()) && (drawData.lightCounts[vertex] > 0);
+            if (lit || ((vertex * 4 + 3) >= drawData.normColBytes.size())) {
+                continue;
+            }
+
+            for (int c = 0; c < 3; c++) {
+                colorSum[c] += float(drawData.normColBytes[vertex * 4 + c]) / 255.0f;
+            }
+
+            colorCount++;
+        }
+
+        for (int c = 0; c < 3; c++) {
+            signature.vertexColor[c] = (colorCount > 0) ? (colorSum[c] / float(colorCount)) : 0.0f;
+        }
+
+        signature.triangles = call.callDesc.triangleCount;
+        signature.kind = kind;
+        signature.computeSignature();
+        return signature;
+    }
+
+    // Where a draw's texture is seen, for the material guess: whether it's lit with vertex normals (characters and
+    // objects) and how much of its area faces up or down (floors, ceilings) against sideways (walls).
+    static RtMaterialPlacement measureMaterialPlacement(const DrawData &drawData, uint32_t indexStart, uint32_t triangleCount, bool alphaTested) {
+        const uint32_t MaxSampledTriangles = 64;
+        RtMaterialPlacement placement;
+        placement.alphaTested = alphaTested;
+        placement.triangleCount = triangleCount;
+        const uint32_t step = std::max(triangleCount / MaxSampledTriangles, 1u);
+        float upArea = 0.0f;
+        float totalArea = 0.0f;
+        uint32_t litVertices = 0;
+        uint32_t vertices = 0;
+        for (uint32_t t = 0; t < triangleCount; t += step) {
+            ShadowVec3 p[3];
+            bool valid = true;
+            for (uint32_t k = 0; k < 3; k++) {
+                const uint32_t index = indexStart + t * 3 + k;
+                if (index >= drawData.faceIndices.size()) {
+                    valid = false;
+                    break;
+                }
+
+                const uint32_t vertex = drawData.faceIndices[index];
+                const interop::float4x4 *transform = nullptr;
+                if (!scenePosition(drawData, vertex, p[k].x, p[k].y, p[k].z, transform)) {
+                    valid = false;
+                    break;
+                }
+
+                litVertices += ((vertex < drawData.lightCounts.size()) && (drawData.lightCounts[vertex] > 0)) ? 1 : 0;
+                vertices++;
+            }
+
+            if (!valid) {
+                continue;
+            }
+
+            const ShadowVec3 normal = (p[1] - p[0]).cross(p[2] - p[0]);
+            const float area = normal.length();
+            if (area > 1e-6f) {
+                upArea += std::fabs(normal.y);
+                totalArea += area;
+            }
+        }
+
+        placement.upFacing = (totalArea > 1e-6f) ? (upArea / totalArea) : 0.5f;
+        placement.lit = (vertices > 0) && (litVertices * 2 > vertices);
+        return placement;
+    }
+
+    // Diagonal of the draw's bounding box in the horizontal (XZ) plane, from up to 192 of its vertices.
+    static float horizontalSpan(const DrawData &drawData, uint32_t indexStart, uint32_t indexCount) {
+        const uint32_t MaxSampledIndices = 192;
+        const uint32_t step = std::max(indexCount / MaxSampledIndices, 1u);
+        float minX = FLT_MAX, maxX = -FLT_MAX, minZ = FLT_MAX, maxZ = -FLT_MAX;
+        for (uint32_t i = 0; i < indexCount; i += step) {
+            if ((indexStart + i) >= drawData.faceIndices.size()) {
+                break;
+            }
+
+            const interop::float4x4 *transform = nullptr;
+            float x, y, z;
+            if (scenePosition(drawData, drawData.faceIndices[indexStart + i], x, y, z, transform)) {
+                minX = std::min(minX, x);
+                maxX = std::max(maxX, x);
+                minZ = std::min(minZ, z);
+                maxZ = std::max(maxZ, z);
+            }
+        }
+
+        return (maxX >= minX) ? std::sqrt((maxX - minX) * (maxX - minX) + (maxZ - minZ) * (maxZ - minZ)) : 0.0f;
+    }
+
+    // Diagonal of the draw's 3D bounding box, from up to 24 of its vertices: cheap enough for every path traced draw.
+    static float drawExtent(const DrawData &drawData, uint32_t indexStart, uint32_t indexCount) {
+        const uint32_t MaxSampledIndices = 24;
+        const uint32_t step = std::max(indexCount / MaxSampledIndices, 1u);
+        float minP[3] = { FLT_MAX, FLT_MAX, FLT_MAX };
+        float maxP[3] = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+        for (uint32_t i = 0; (i < indexCount) && ((indexStart + i) < drawData.faceIndices.size()); i += step) {
+            const interop::float4x4 *transform = nullptr;
+            float p[3];
+            if (scenePosition(drawData, drawData.faceIndices[indexStart + i], p[0], p[1], p[2], transform)) {
+                for (int c = 0; c < 3; c++) {
+                    minP[c] = std::min(minP[c], p[c]);
+                    maxP[c] = std::max(maxP[c], p[c]);
+                }
+            }
+        }
+
+        if (maxP[0] < minP[0]) {
+            return 0.0f;
+        }
+
+        const float dx = maxP[0] - minP[0], dy = maxP[1] - minP[1], dz = maxP[2] - minP[2];
+        return std::sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    // Texture scrolling of a draw, followed across frames by its texture, vertex load and size: the game scrolls water by
+    // moving the tile offset or by rewriting the vertex texture coordinates. A draw seen more than once in a frame (the
+    // same mesh drawn twice) can't be told apart from scrolling, so it never counts.
+    struct WaterScrollTrack {
+        float tileS = 0.0f;
+        float tileT = 0.0f;
+        float u = 0.0f;
+        float v = 0.0f;
+        uint32_t lastFrame = 0;
+        uint32_t lastMovedFrame = 0;
+        bool movedEver = false;
+        bool repeated = false;
+    };
+
+    static std::unordered_map<uint64_t, WaterScrollTrack> waterScrollTracks;
+
+    static bool drawScrolls(const DrawData &drawData, const GameCall &call, uint64_t textureKey, uint32_t frame) {
+        if ((call.callDesc.tileCount == 0) || (call.callDesc.tileIndex >= drawData.rdpTiles.size()) || (call.meshDesc.faceIndicesStart >= drawData.faceIndices.size())) {
+            return false;
+        }
+
+        const uint32_t vertex = drawData.faceIndices[call.meshDesc.faceIndicesStart];
+        if ((vertex * 2 + 1) >= drawData.tcFloats.size()) {
+            return false;
+        }
+
+        const interop::RDPTile &tile = drawData.rdpTiles[call.callDesc.tileIndex];
+        const float u = drawData.tcFloats[vertex * 2 + 0];
+        const float v = drawData.tcFloats[vertex * 2 + 1];
+        const uint64_t id = textureKey ^ (uint64_t(call.callDesc.vertexAddress) << 20) ^ (uint64_t(call.callDesc.triangleCount) * 0x9E3779B97F4A7C15ULL);
+        if (waterScrollTracks.size() > 4096) {
+            waterScrollTracks.clear();
+        }
+
+        auto inserted = waterScrollTracks.try_emplace(id);
+        WaterScrollTrack &track = inserted.first->second;
+        if (!inserted.second) {
+            if (track.lastFrame == frame) {
+                track.repeated = true;
+            }
+            else if ((frame - track.lastFrame) <= 4) {
+                const float MinMove = 1e-3f;
+                const bool moved = (std::fabs(tile.uls - track.tileS) > MinMove) || (std::fabs(tile.ult - track.tileT) > MinMove) ||
+                    (std::fabs(u - track.u) > MinMove) || (std::fabs(v - track.v) > MinMove);
+                if (moved) {
+                    track.lastMovedFrame = frame;
+                    track.movedEver = true;
+                }
+            }
+        }
+
+        track.tileS = tile.uls;
+        track.tileT = tile.ult;
+        track.u = u;
+        track.v = v;
+        track.lastFrame = frame;
+        // Scrolling games often step the offset every few frames.
+        const uint32_t ScrollMemoryFrames = 60;
+        return track.movedEver && !track.repeated && ((frame - track.lastMovedFrame) <= ScrollMemoryFrames);
+    }
+
+    // Splits an effect draw into its connected sprite pieces and records each small piece as a possible light source.
+    // Whether it really emits is decided on the GPU from the sprite's sampled color. Large pieces lying flat on the
+    // ground (battle circles, ground decals) are rejected here: they would light the floor from inside it.
+    // A draw with this many long, narrow pieces is line drawing (the battle circle is drawn from line segments), not
+    // a light source. A single thin piece, like a spell streak, is still a candidate.
+    static const float kEmissiveThinAspect = 6.0f;
+    static const uint32_t kEmissiveMaxThinPiecesPerDraw = 3;
+
+    static EmissiveDrawInfo collectEmissiveCandidates(const DrawData &drawData, uint32_t indexStart, uint32_t indexCount, uint32_t renderIndex, uint64_t key, EmissiveCategory category,
+        float maxExtent, std::vector<EmissiveCandidate> &candidates, EmissiveRejections &rejections)
+    {
+        const uint32_t MaxCandidateTriangles = 256;
+        const uint32_t MaxPiecesPerDraw = 64;
+        const float MinExtent = 0.5f;
+        const float MaxGroundFlatExtent = 40.0f;
+        const float GroundFlatNormalY = 0.85f;
+        const uint32_t triangleCount = indexCount / 3;
+        EmissiveDrawInfo info;
+        info.key = key;
+        info.category = category;
+        info.triangleCount = triangleCount;
+        if ((triangleCount == 0) || (triangleCount > MaxCandidateTriangles) || (indexStart + indexCount > drawData.faceIndices.size())) {
+            return info;
+        }
+
+        const size_t firstCandidate = candidates.size();
+
+        thread_local std::vector<uint32_t> componentTriangles;
+        thread_local std::vector<uint32_t> componentStarts;
+        splitShadowComponents(drawData, indexStart, indexCount, componentTriangles, componentStarts);
+        const size_t pieceCount = std::min(componentStarts.size() - 1, size_t(MaxPiecesPerDraw));
+        info.pieces = uint32_t(pieceCount);
+        for (size_t c = 0; c < pieceCount; c++) {
+            ShadowVec3 center = { 0.0f, 0.0f, 0.0f };
+            uint32_t pointCount = 0;
+            thread_local std::vector<ShadowVec3> points;
+            points.clear();
+            for (uint32_t i = componentStarts[c]; i < componentStarts[c + 1]; i++) {
+                for (uint32_t k = 0; k < 3; k++) {
+                    const uint32_t vertex = drawData.faceIndices[indexStart + componentTriangles[i] * 3 + k];
+                    const interop::float4x4 *transform = nullptr;
+                    ShadowVec3 p;
+                    if (scenePosition(drawData, vertex, p.x, p.y, p.z, transform)) {
+                        points.push_back(p);
+                        center = center + p;
+                        pointCount++;
+                    }
+                }
+            }
+
+            if (pointCount == 0) {
+                continue;
+            }
+
+            center = center * (1.0f / float(pointCount));
+            float extent = 0.0f;
+            for (const ShadowVec3 &p : points) {
+                extent = std::max(extent, (p - center).length());
+            }
+
+            // Aspect: the longest span between two corners against the widest offset from that span.
+            float length = 0.0f;
+            ShadowVec3 spanA = points[0];
+            ShadowVec3 spanB = points[0];
+            for (size_t a = 0; a < points.size(); a++) {
+                for (size_t b = a + 1; b < points.size(); b++) {
+                    const float span = (points[b] - points[a]).length();
+                    if (span > length) {
+                        length = span;
+                        spanA = points[a];
+                        spanB = points[b];
+                    }
+                }
+            }
+
+            float width = 0.0f;
+            float axisUp = 0.0f;
+            if (length > 1e-6f) {
+                const ShadowVec3 axis = (spanB - spanA) * (1.0f / length);
+                axisUp = std::fabs(axis.y);
+                for (const ShadowVec3 &p : points) {
+                    const ShadowVec3 offset = p - spanA;
+                    const ShadowVec3 across = offset - axis * offset.dot(axis);
+                    width = std::max(width, across.length());
+                }
+            }
+
+            // Only lying strips count as line drawing (the battle circle's segments run along the ground). Upright
+            // strips are beam columns and spell streaks.
+            const float aspect = length / std::max(width, length * 1e-3f + 1e-6f);
+            const bool thin = (aspect > kEmissiveThinAspect) && (axisUp < 0.5f);
+            info.maxAspect = std::max(info.maxAspect, aspect);
+            info.maxExtent = std::max(info.maxExtent, extent);
+            info.thinPieces += thin ? 1 : 0;
+
+            if (extent < MinExtent) {
+                rejections.tooSmall++;
+                continue;
+            }
+
+            if (extent > maxExtent) {
+                rejections.tooLarge++;
+                continue;
+            }
+
+            // The plane of the piece from its largest triangle.
+            ShadowVec3 normal = { 0.0f, 0.0f, 0.0f };
+            float normalLength = 0.0f;
+            for (size_t i = 0; i + 2 < points.size(); i += 3) {
+                const ShadowVec3 faceNormal = (points[i + 1] - points[i]).cross(points[i + 2] - points[i]);
+                const float faceLength = faceNormal.length();
+                if (faceLength > normalLength) {
+                    normal = faceNormal;
+                    normalLength = faceLength;
+                }
+            }
+
+            const bool horizontal = (normalLength > 1e-6f) && (std::fabs(normal.y / normalLength) > GroundFlatNormalY);
+            if (horizontal && (extent > MaxGroundFlatExtent)) {
+                rejections.groundFlat++;
+                continue;
+            }
+
+            EmissiveCandidate candidate;
+            candidate.center[0] = center.x;
+            candidate.center[1] = center.y;
+            candidate.center[2] = center.z;
+            candidate.extent = extent;
+            candidate.renderIndex = renderIndex;
+            candidate.triangleCount = triangleCount;
+            candidate.key = key;
+            candidate.category = category;
+            candidate.thin = thin;
+            candidates.push_back(candidate);
+        }
+
+        // Line drawing: drop every thin piece of the draw.
+        if (info.thinPieces > kEmissiveMaxThinPiecesPerDraw) {
+            const size_t before = candidates.size();
+            candidates.erase(std::remove_if(candidates.begin() + firstCandidate, candidates.end(), [](const EmissiveCandidate &candidate) { return candidate.thin; }), candidates.end());
+            rejections.thinLinePieces += uint32_t(before - candidates.size());
+        }
+
+        info.accepted = uint32_t(candidates.size() - firstCandidate);
+        return info;
+    }
+
     static bool buildDirectionalShadow(const DrawData &drawData, float nativeWidth, float nativeHeight, const std::vector<ShadowFitRange> &ranges, const float localDirection[3], interop::float4x4 &lightMatrix, interop::float3 &lightDirection, interop::float3 &worldUp) {
         struct Point {
             float x, y, z, w;
@@ -984,12 +1400,18 @@ namespace RT64 {
         instanceDrawCallVector.clear();
         hitGroupVector.clear();
         renderIndicesVector.clear();
+        rtMaterialsVector.clear();
         rspSmoothNormalVector.clear();
         frameParams.viewUbershaders = ubershadersVisible;
         frameParams.ditherNoiseStrength = ditherNoiseStrength;
         framebufferCount = 0;
         shadowCutoutChunkCursor = 0;
         shadowMapSetCursor = 0;
+#   if RT_ENABLED
+        rtFrameExtras = RaytracingScene();
+        rtDiagRecording = raytracingDiagnosticsCaptureRequested();
+        rtDiagDrawRecords.clear();
+#   endif
 
         // Create dummy color target if it hasn't been created yet.
         if (dummyColorTarget == nullptr) {
@@ -1016,10 +1438,18 @@ namespace RT64 {
         assert(rtShaderCache != nullptr);
         assert(blueNoiseTexture != nullptr);
 
+        // The pipeline is built in the background; frames stay rasterized until it's swapped in here.
+        rtShaderCache->update();
+        if (rtShaderCache->states.empty()) {
+            rtShaderCache->states.resize(1);
+        }
+
         const int32_t stateIndex = rtShaderCache->getActiveState();
         rtState = &rtShaderCache->states[stateIndex];
         rtPipelineLayout = rtShaderCache->pipelineLayout.get();
         rtResources->resetBottomLevelAS();
+        rtResources->shaderFormat = rtShaderCache->shaderFormat;
+        rtResources->shaderLibrary = shaderLibrary;
 
         this->blueNoiseTexture = blueNoiseTexture;
     }
@@ -1175,13 +1605,16 @@ namespace RT64 {
             const uint32_t hitBufferBytes = 256;
             descCommonSet->setBuffer(descCommonSet->gHitVelocityDistance, rtResources->hitVelocityDistanceBuffer.get(), hitBufferBytes, rtResources->hitVelocityDistanceBufferView.get());
             descCommonSet->setBuffer(descCommonSet->gHitColor, rtResources->hitColorBuffer.get(), hitBufferBytes, rtResources->hitColorBufferView.get());
-            descCommonSet->setBuffer(descCommonSet->gHitNormalFog, rtResources->hitNormalFogBuffer.get(), hitBufferBytes, rtResources->hitNormalFogBufferView.get());
-            descCommonSet->setBuffer(descCommonSet->gHitInstanceId, rtResources->hitInstanceIdBuffer.get(), hitBufferBytes, rtResources->hitInstanceIdBufferView.get());
+            descCommonSet->setBuffer(descCommonSet->gHitNormalFog, rtResources->hitNormalFogBuffer.get(), RaytracingResources::HitNormalFogEntries * sizeof(float) * 4, rtResources->hitNormalFogBufferView.get());
+            // 256 counters (see kDiagCounterBytes in rt64_raytracing_resources.cpp).
+            const uint32_t hitCounterBytes = 1024;
+            descCommonSet->setBuffer(descCommonSet->gHitInstanceId, rtResources->hitInstanceIdBuffer.get(), hitCounterBytes, rtResources->hitInstanceIdBufferView.get());
             descCommonSet->setAccelerationStructure(descCommonSet->SceneBVH, rtResources->topLevelAS.get());
             descCommonSet->setBuffer(descCommonSet->SceneLights, rtResources->lightsBuffer.get(), sizeof(interop::PointLight) * std::max(rtResources->rtParams.lightsCount, 1U), RenderBufferStructuredView(sizeof(interop::PointLight)));
             descCommonSet->setBuffer(descCommonSet->interleavedRasters, interleavedRastersBuffer.get(), sizeof(interop::InterleavedRaster) * std::max(interleavedRastersCount, 1U), RenderBufferStructuredView(sizeof(interop::InterleavedRaster)));
             descCommonSet->setTexture(descCommonSet->gBlueNoise, blueNoiseTexture, RenderTextureLayout::SHADER_READ);
             descCommonSet->setBuffer(descCommonSet->instanceExtraParams, drawBuffers->extraParamsBuffer.get(), RenderBufferStructuredView(sizeof(interop::ExtraParams)));
+            descCommonSet->setBuffer(descCommonSet->gRtMaterials, rtMaterialsBuffer.get(), RenderBufferStructuredView(sizeof(uint32_t)));
             descCommonSet->setBuffer(descCommonSet->RtParams, rtResources->rtParamsBuffer.get(), sizeof(interop::RaytracingParams));
         }
 #   endif
@@ -1834,21 +2267,13 @@ namespace RT64 {
         auto &rtParams = rtResources->rtParams;
         const bool lumaActive = rtScene.presetScene.luminanceRange > 0.0f;
 
-        // Only use jitter when an upscaler is active.
-        Upscaler *upscaler = rtResources->getUpscaler(rtResources->upscalerMode);
-        bool jitterActive = rtResources->upscaleActive && (upscaler != nullptr);
-        if (jitterActive) {
-            const int phaseCount = upscaler->getJitterPhaseCount(rtResources->textureWidth, rtScene.screenWidth);
-            rtParams.pixelJitter = HaltonJitter(frameParams.frameCount, phaseCount);
-        }
-        else {
-            rtParams.pixelJitter = { 0.0f, 0.0f };
-        }
-
-        rtParams.viewport.x = rtScene.viewport.x;
-        rtParams.viewport.y = rtScene.viewport.y;
-        rtParams.viewport.z = rtScene.viewport.width;
-        rtParams.viewport.w = rtScene.viewport.height;
+        // The viewport in ray tracing pixels: the same as the screen's unless the ray traced image is upscaled.
+        const float renderScaleX = float(rtResources->textureWidth) / float(std::max(rtResources->displayWidth, 1u));
+        const float renderScaleY = float(rtResources->textureHeight) / float(std::max(rtResources->displayHeight, 1u));
+        rtParams.viewport.x = rtScene.viewport.x * renderScaleX;
+        rtParams.viewport.y = rtScene.viewport.y * renderScaleY;
+        rtParams.viewport.z = rtScene.viewport.width * renderScaleX;
+        rtParams.viewport.w = rtScene.viewport.height * renderScaleY;
 
         const auto &preset = rtScene.presetScene;
         rtParams.ambientBaseColor = hlslpp::float4(preset.ambientBaseColor, 0.0f);
@@ -1878,22 +2303,28 @@ namespace RT64 {
             rtParams.farDist = 1000.0f;
         }
 
+        rtResources->cameraNearPlane = rtParams.nearDist;
+        rtResources->cameraFarPlane = rtParams.farDist;
         rtParams.view = rtScene.curViewMatrix;
         rtParams.projection = rtScene.curProjMatrix;
         rtParams.viewProj = hlslpp::mul(rtParams.view, rtParams.projection);
         // viewI is the inverse of the same view-projection the rasterizer uses, so rays match its pixels.
         rtParams.viewI = hlslpp::inverse(rtParams.viewProj);
         rtParams.projectionI = hlslpp::inverse(rtParams.projection);
-        rtParams.prevViewProj = hlslpp::mul(rtScene.prevViewMatrix, rtScene.prevProjMatrix);
+        // History reprojection uses the view-projection the ray tracer itself used last frame.
+        rtParams.prevViewProj = rtResources->previousViewProjValid ? rtResources->previousViewProj : rtParams.viewProj;
+        rtResources->previousViewProj = rtParams.viewProj;
+        rtResources->previousViewProjValid = true;
         // +1 when the viewport's Y scale points down the screen. The ray shader uses this to map pixels to clip Y.
         rtParams.nearDist = (rtScene.viewportScaleY >= 0.0f) ? 1.0f : -1.0f;
         rtParams.farDist = 1.0e7f;
 
         // Angle between the camera rays of two vertically neighboring pixels at the center of the viewport, using the
-        // same unprojection as the ray generation shader.
+        // same unprojection as the ray generation shader. It's measured in display pixels, so an upscaled image keeps
+        // the texture detail of the display resolution.
         {
             const hlslpp::float4x4 viewProjInverse = rtParams.viewI;
-            const float viewportH = std::max(float(rtParams.viewport.w), 1.0f);
+            const float viewportH = std::max(float(rtScene.viewport.height), 1.0f);
             auto rayDirection = [&](float pixelY) {
                 const float vpY = pixelY / viewportH;
                 const float clipY = -((-rtParams.nearDist) + (2.0f * rtParams.nearDist) * vpY);
@@ -1915,6 +2346,55 @@ namespace RT64 {
             }
 
             rtParams.pixelSpreadAngle = (std::isfinite(spread) && (spread > 1e-6f)) ? spread : 0.001f;
+        }
+
+        // Calibrate face culling for camera rays in world space, where it stays defined for triangles that cross the
+        // camera plane (walls the camera clips into). A small triangle in front of the camera is classified with the
+        // raster's screen space rule (clockwise on screen is culled) and with the sign of dot(normal, view direction);
+        // the shader then culls a hit when dot(normal, ray direction) * cullWindingSign > 0.
+        {
+            const hlslpp::float4x4 viewProj = rtParams.viewProj;
+            const hlslpp::float4x4 viewProjInverse = rtParams.viewI;
+            const hlslpp::float4 originH = hlslpp::mul(hlslpp::float4(0.0f, 0.0f, 1.0f, 0.0f), viewProjInverse);
+            const hlslpp::float4 midH = hlslpp::mul(hlslpp::float4(0.0f, 0.0f, 0.0f, 1.0f), viewProjInverse);
+            float sign = 1.0f;
+            if ((std::fabs(float(originH.w)) > 1e-12f) && (std::fabs(float(midH.w)) > 1e-12f)) {
+                const hlslpp::float3 origin = hlslpp::float3(originH.xyz) / float(originH.w);
+                const hlslpp::float3 mid = hlslpp::float3(midH.xyz) / float(midH.w);
+                const float distance = float(hlslpp::length(mid - origin));
+                if (distance > 1e-6f) {
+                    const hlslpp::float3 forward = (mid - origin) / distance;
+                    hlslpp::float3 up(0.0f, 1.0f, 0.0f);
+                    if (std::fabs(float(hlslpp::dot(up, forward))) > 0.9f) {
+                        up = hlslpp::float3(1.0f, 0.0f, 0.0f);
+                    }
+
+                    const hlslpp::float3 right = hlslpp::normalize(hlslpp::cross(forward, up));
+                    const hlslpp::float3 upAxis = hlslpp::cross(right, forward);
+                    const float size = distance * 0.01f;
+                    const hlslpp::float3 corners[3] = { mid, mid + right * size, mid + upAxis * size };
+                    float screen[3][2];
+                    bool valid = true;
+                    for (int i = 0; i < 3; i++) {
+                        const hlslpp::float4 clip = hlslpp::mul(hlslpp::float4(corners[i], 1.0f), viewProj);
+                        const float w = float(clip.w);
+                        valid = valid && (w > 1e-6f);
+                        screen[i][0] = float(clip.x) / w;
+                        screen[i][1] = float(clip.y) / w;
+                    }
+
+                    if (valid) {
+                        const float e1x = screen[1][0] - screen[0][0], e1y = screen[1][1] - screen[0][1];
+                        const float e2x = screen[2][0] - screen[0][0], e2y = screen[2][1] - screen[0][1];
+                        const bool screenCulled = ((e1x * e2y - e1y * e2x) * rtParams.nearDist) < 0.0f;
+                        const hlslpp::float3 normal = hlslpp::cross(corners[1] - corners[0], corners[2] - corners[0]);
+                        const bool normalAlongView = float(hlslpp::dot(normal, forward)) > 0.0f;
+                        sign = (screenCulled == normalAlongView) ? 1.0f : -1.0f;
+                    }
+                }
+            }
+
+            rtParams.cullWindingSign = sign;
         }
 
         // cameraW carries the shadow tuning of the scene light shared with the shadow map pass: the color
@@ -1950,23 +2430,85 @@ namespace RT64 {
         rtParams.giReproject = !rtResources->skipReprojection && rtResources->denoiserEnabled && (rtParams.giSamples > 0) && (rtResources->upscalerMode != UpscaleMode::DLSS) ? 1 : 0;
         rtParams.binaryLockMask = (rtResources->upscalerMode != UpscaleMode::FSR);
         rtParams.interleavedRastersCount = interleavedRastersCount;
+        rtParams.debugView = raytracingDebugView();
+
+        // rt_lights.json "room settings": rooms lit only by their manual and emissive lights. History is dropped for a
+        // frame when it switches, so the old sun doesn't fade out over the new room.
+        {
+            const char *source = "default";
+            const char *scope = "no entry";
+            const bool sunAndMoon = rtMaterialDatabase().sunAndMoonEnabled(rtScene.areaMap, rtScene.areaRoom, source, scope);
+            const uint32_t sunDisabled = sunAndMoon ? 0u : 1u;
+            const uint32_t bounces = raytracingIndirectBounces();
+            rtParams.historyReset = (((rtResources->lastSunDisabled >= 0) && (uint32_t(rtResources->lastSunDisabled) != sunDisabled)) ||
+                ((rtResources->lastIndirectBounces != 0) && (rtResources->lastIndirectBounces != bounces))) ? 1u : 0u;
+            rtParams.indirectBounces = bounces;
+            rtResources->lastIndirectBounces = bounces;
+            rtParams.waterDraws = raytracingAdvancedWater() ? uint32_t(rtScene.waterDraws.size()) : 0u;
+            static const std::chrono::steady_clock::time_point waterClockStart = std::chrono::steady_clock::now();
+            const double waterSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - waterClockStart).count();
+            rtParams.waterTime = float(std::fmod(waterSeconds, 3600.0));
+            rtParams.sunDisabled = sunDisabled;
+            rtResources->lastSunDisabled = int32_t(sunDisabled);
+            rtResources->sunSettingSource = source;
+            rtResources->sunSettingScope = scope;
+        }
+
+        // Jitter, display scale and history resets of the upscaler (after historyReset is known).
+        rtResources->updateUpscalerFrame(frameParams.frameCount);
         
         Framebuffer &framebuffer = framebufferVector[framebufferCount - 1];
         RenderDescriptorSet *descRealDepthSet = framebuffer.descRealFbSet->get();
         RenderDescriptorSet *descriptorSets[] = { descCommonSet->get(), descTextureSet->get(), descTextureSet->get(), descRealDepthSet };
         rtResources->updateTopLevelASResources(worker, rtScene.instances);
         rtResources->createShaderBindingTable(worker, rtState, descriptorSets, uint32_t(std::size(descriptorSets)), hitGroupVector);
-        rtResources->updateLightsBuffer(worker, rtScene);
+        const float cameraPosition[3] = { float(rtParams.cameraV.x), float(rtParams.cameraV.y), float(rtParams.cameraV.z) };
+        rtResources->updateEmissiveLights(rtScene, cameraPosition);
+        rtResources->updateMaterialProbes(rtScene);
+        rtResources->readMaterialPreviews();
+        rtMaterialDatabase().saveIfDirty(rtResources->emissiveFrame, false);
+        rtResources->updateLightsBuffer(worker);
 
         rtResources->readDiagnosticBuffers();
+        rtResources->readDecalCheckCounters();
         rtResources->diagFrame++;
         const uint32_t diagFrame = rtResources->diagFrame;
-        rtResources->diagCaptureThisFrame = (diagFrame == 60) || (diagFrame == 600) || (diagFrame == 3000);
+        // A few early captures, a periodic one, and one on request (F9 in game).
+        const bool requested = rtDiagRecording && consumeRaytracingDiagnosticsCapture();
+        rtResources->diagCaptureThisFrame = requested || (diagFrame == 60) || (diagFrame == 600) || (diagFrame == 3000) || ((diagFrame > 3000) && ((diagFrame % 2400) == 0));
+
+        // Decal check: every 1.5 seconds or so, the camera hits of a few decals are counted on the GPU and read back,
+        // so a decal the decal query can't show goes back to the raster without waiting for a capture.
+        rtParams.decalsPresent = rtScene.decalInfos.empty() ? 0u : 1u;
+        rtParams.decalCheck = 0;
+        rtResources->decalCheckThisFrame = false;
+        const uint32_t DecalCheckInterval = 90;
+        if (!rtResources->diagCaptureThisFrame && !rtScene.decalInfos.empty() && ((diagFrame % DecalCheckInterval) == 0) &&
+            (rtResources->decalCheckDelay < 0) && (rtResources->diagReadbackDelay < 0))
+        {
+            rtResources->assignDecalSlots(rtScene, true);
+            rtParams.decalCheck = 1;
+            rtResources->decalCheckThisFrame = true;
+        }
         if (rtResources->diagCaptureThisFrame) {
             // Tells the any-hit shaders to count rejected texels this frame.
             rtParams.cameraV.w = 2.0f;
+            if (requested) {
+                rtDiagLog("##### Capture requested with F9 #####");
+            }
+
             rtResources->logSceneDiagnostics(rtScene);
+            rtResources->logUpscalerDiagnostics();
+            if (requested) {
+                rtDiagLog("  draws that are not path traced this frame (%zu%s):", rtDiagDrawRecords.size(), (rtDiagDrawRecords.size() >= 250) ? ", list capped" : "");
+                for (const std::string &record : rtDiagDrawRecords) {
+                    rtDiagLog("    %s", record.c_str());
+                }
+            }
         }
+
+        rtDiagRecording = false;
+        rtDiagDrawRecords.clear();
     }
     
     void FramebufferRenderer::submitRaytracingScene(RenderWorker *worker, RenderTarget *colorTarget, const RaytracingScene &rtScene) {
@@ -2026,9 +2568,13 @@ namespace RT64 {
         }
 
         const bool diagCapture = rtResources->diagCaptureThisFrame;
-        if (diagCapture) {
+        const bool decalCheck = rtResources->decalCheckThisFrame && !diagCapture;
+        if (diagCapture || decalCheck) {
             rtResources->clearDiagnosticBuffers(worker);
         }
+
+        rtResources->copyMaterialPreviews(worker, rtScene);
+        rtResources->beginPassTiming(worker);
 
         // Bind pipeline and dispatch primary rays.
         RT64_LOG_PRINTF("Dispatching primary rays");
@@ -2042,6 +2588,7 @@ namespace RT64 {
         worker->commandList->setRaytracingDescriptorSet(descTextureSet->get(), 2);
         worker->commandList->setRaytracingDescriptorSet(descRealFbSet, 3);
         worker->commandList->traceRays(rtResources->textureWidth, rtResources->textureHeight, 1, rtResources->shaderBindingTableBuffer->at(0), rtResources->shaderBindingTableInfo.groups);
+        rtResources->writePassTimestamp(worker, RaytracingResources::PassTimestamp::Primary);
 
         // Barriers for shading buffers before dispatching secondary rays.
         RenderTextureBarrier shadingBarriers[] = {
@@ -2059,20 +2606,33 @@ namespace RT64 {
 
         worker->commandList->barriers(RenderBarrierStage::COMPUTE, shadingBarriers, uint32_t(std::size(shadingBarriers)));
 
+        // Sample the color of each emissive light from its source sprite before the light passes use it.
+        // The same dispatch samples the textures of the material probes.
+        const uint32_t emissiveLightCount = rtResources->rtParams.emissiveLightCount + rtResources->rtParams.materialProbeCount;
+        if (emissiveLightCount > 0) {
+            RT64_LOG_PRINTF("Dispatching emissive light color rays");
+            worker->commandList->barriers(RenderBarrierStage::COMPUTE, RenderBufferBarrier(rtResources->hitNormalFogBuffer.get(), RenderBufferAccess::WRITE));
+            rtResources->shaderBindingTableInfo.groups.rayGen.startIndex = 5;
+            worker->commandList->traceRays(emissiveLightCount, 1, 1, rtResources->shaderBindingTableBuffer->at(0), rtResources->shaderBindingTableInfo.groups);
+            worker->commandList->barriers(RenderBarrierStage::COMPUTE, RenderBufferBarrier(rtResources->hitNormalFogBuffer.get(), RenderBufferAccess::WRITE));
+
+            // Read the glow back a few frames later to learn which sources really emit.
+            rtResources->copyEmissiveGlow(worker);
+        }
+
+        rtResources->writePassTimestamp(worker, RaytracingResources::PassTimestamp::Emissive);
+
         // Dispatch rays for direct light.
         RT64_LOG_PRINTF("Dispatching direct light rays");
         rtResources->shaderBindingTableInfo.groups.rayGen.startIndex = 1;
         worker->commandList->traceRays(rtResources->textureWidth, rtResources->textureHeight, 1, rtResources->shaderBindingTableBuffer->at(0), rtResources->shaderBindingTableInfo.groups);
+        rtResources->writePassTimestamp(worker, RaytracingResources::PassTimestamp::Direct);
 
         // Dispatch rays for indirect light.
         RT64_LOG_PRINTF("Dispatching indirect light rays");
         rtResources->shaderBindingTableInfo.groups.rayGen.startIndex = 2;
         worker->commandList->traceRays(rtResources->textureWidth, rtResources->textureHeight, 1, rtResources->shaderBindingTableBuffer->at(0), rtResources->shaderBindingTableInfo.groups);
-
-        if (diagCapture) {
-            rtResources->copyDiagnosticBuffers(worker);
-            rtResources->diagCaptureThisFrame = false;
-        }
+        rtResources->writePassTimestamp(worker, RaytracingResources::PassTimestamp::Indirect);
 
         // Wait until indirect light is done before dispatching reflection or refraction rays.
         // TODO: This is only required to prevent simultaneous usage of the anyhit buffers.
@@ -2083,6 +2643,7 @@ namespace RT64 {
         RT64_LOG_PRINTF("Dispatching refraction rays");
         rtResources->shaderBindingTableInfo.groups.rayGen.startIndex = 4;
         worker->commandList->traceRays(rtResources->textureWidth, rtResources->textureHeight, 1, rtResources->shaderBindingTableBuffer->at(0), rtResources->shaderBindingTableInfo.groups);
+        rtResources->writePassTimestamp(worker, RaytracingResources::PassTimestamp::Refraction);
 
         // Wait until refraction is done before dispatching reflection rays.
         // TODO: This is only required to prevent simultaneous usage of the anyhit buffers.
@@ -2090,7 +2651,8 @@ namespace RT64 {
         worker->commandList->barriers(RenderBarrierStage::COMPUTE, RenderTextureBarrier(rtResources->refractionTexture.get(), RenderTextureLayout::GENERAL));
 
         // Reflection passes.
-        int reflections = rtResources->maxReflections;
+        // The first pass also adds the specular highlights of the surface materials, so it always runs.
+        int reflections = std::max(rtResources->maxReflections, 1);
         while (reflections > 0) {
             // Dispatch rays for reflection.
             RT64_LOG_PRINTF("Dispatching reflection rays");
@@ -2109,6 +2671,18 @@ namespace RT64 {
 
                 worker->commandList->barriers(RenderBarrierStage::COMPUTE, newInputBarriers, uint32_t(std::size(newInputBarriers)));
             }
+        }
+
+        rtResources->writePassTimestamp(worker, RaytracingResources::PassTimestamp::Reflection);
+
+        // After the specular pass, so the center pixel's specular is in the capture too.
+        if (diagCapture) {
+            rtResources->copyDiagnosticBuffers(worker);
+            rtResources->diagCaptureThisFrame = false;
+        }
+        else if (decalCheck) {
+            rtResources->copyDecalCheckCounters(worker);
+            rtResources->decalCheckThisFrame = false;
         }
 
         // Copy direct light raw buffer to the first direct filtered buffer.
@@ -2154,9 +2728,12 @@ namespace RT64 {
             worker->commandList->barriers(RenderBarrierStage::COMPUTE, afterCopyBarriers, uint32_t(std::size(afterCopyBarriers)));
         }
 
-        // Apply a gaussian filter to the indirect light with a compute shader.
+        // Apply a gaussian filter to the indirect light (fill and ambient occlusion) with a compute shader. Temporal
+        // accumulation does most of the denoising, so a few passes are enough and occlusion stays tight at edges. The
+        // pass count must be odd so the result ends in filteredIndirectLightTexture[1].
+        const int IndirectFilterPasses = 3;
         if (denoiseGI) {
-            for (int i = 0; i < 5; i++) {
+            for (int i = 0; i < IndirectFilterPasses; i++) {
                 const uint32_t ThreadGroupWorkCount = 8;
                 uint32_t dispatchX = (rtResources->textureWidth + ThreadGroupWorkCount - 1) / ThreadGroupWorkCount;
                 uint32_t dispatchY = (rtResources->textureHeight + ThreadGroupWorkCount - 1) / ThreadGroupWorkCount;
@@ -2190,7 +2767,9 @@ namespace RT64 {
             RenderTextureBarrier(rtResources->diffuseTexture.get(), RenderTextureLayout::SHADER_READ),
             RenderTextureBarrier(rtResources->reflectionTexture.get(), RenderTextureLayout::SHADER_READ),
             RenderTextureBarrier(rtResources->refractionTexture.get(), RenderTextureLayout::SHADER_READ),
-            RenderTextureBarrier(rtResources->transparentTexture.get(), RenderTextureLayout::SHADER_READ)
+            RenderTextureBarrier(rtResources->transparentTexture.get(), RenderTextureLayout::SHADER_READ),
+            // ComposePS reads the ambient part of the light factor from the flow texture.
+            RenderTextureBarrier(rtResources->flowTexture.get(), RenderTextureLayout::SHADER_READ)
         };
 
         worker->commandList->barriers(RenderBarrierStage::GRAPHICS, afterDispatchBarriers, uint32_t(std::size(afterDispatchBarriers)));
@@ -2313,53 +2892,16 @@ namespace RT64 {
             }
         }
 
-        Upscaler *upscaler = rtResources->getUpscaler(rtResources->upscalerMode);
-        const bool upscalerActive = rtResources->upscaleActive && (upscaler != nullptr);
-        if (upscalerActive) {
-            thread_local std::vector<RenderTextureBarrier> beforeBarriers;
-            thread_local std::vector<RenderTextureBarrier> afterBarriers;
-            beforeBarriers.clear();
-            afterBarriers.clear();
+        rtResources->writePassTimestamp(worker, RaytracingResources::PassTimestamp::Compose);
 
-            beforeBarriers.push_back(RenderTextureBarrier(rtResources->upscaledOutputTexture.get(), RenderTextureLayout::GENERAL));
-            afterBarriers.push_back(RenderTextureBarrier(rtResources->upscaledOutputTexture.get(), RenderTextureLayout::SHADER_READ));
-            RenderTexture *rtDepthCur = rtResources->depthTexture[rtResources->swapBuffers ? 1 : 0].get();
-            if (upscaler->requiresNonShaderResourceInputs()) {
-                for (RenderTexture *res : { rtOutputCur, rtResources->flowTexture.get(), rtResources->reactiveMaskTexture.get(), rtResources->lockMaskTexture.get(), rtDepthCur }) {
-                    beforeBarriers.push_back(RenderTextureBarrier(res, RenderTextureLayout::SHADER_READ));
-                    afterBarriers.push_back(RenderTextureBarrier(res, RenderTextureLayout::SHADER_READ));
-                }
-            }
+        // Upscale the ray traced image to the display resolution when it was rendered smaller.
+        rtResources->submitUpscale(worker, rtScene.deltaTime * 1000.0f);
+        rtResources->writePassTimestamp(worker, RaytracingResources::PassTimestamp::Upscale);
 
-            worker->commandList->barriers(RenderBarrierStage::COMPUTE, beforeBarriers);
-
-            Upscaler::UpscaleParameters params;
-            params.inRect = { 0, 0, static_cast<int>(rtResources->textureWidth), static_cast<int>(rtResources->textureHeight) };
-            params.inDiffuseAlbedo = rtResources->diffuseTexture.get();
-            params.inSpecularAlbedo = rtResources->shadingSpecularTexture.get();
-            params.inNormalRoughness = rtResources->normalRoughnessTexture[rtResources->swapBuffers ? 1 : 0].get();
-            params.inColor = rtOutputCur;
-            params.inFlow = rtResources->flowTexture.get();
-            params.inReactiveMask = rtResources->upscalerReactiveMask ? rtResources->reactiveMaskTexture.get() : nullptr;
-            params.inLockMask = rtResources->upscalerLockMask ? rtResources->lockMaskTexture.get() : nullptr;
-            params.inDepth = rtDepthCur;
-            params.outColor = rtResources->upscaledOutputTexture.get();
-            params.jitterX = -rtResources->rtParams.pixelJitter.x;
-            params.jitterY = -rtResources->rtParams.pixelJitter.y;
-            params.deltaTime = rtScene.deltaTime * 1000.0f;
-            params.nearPlane = rtResources->rtParams.nearDist;
-            params.farPlane = rtResources->rtParams.farDist;
-            params.fovY = rtResources->rtParams.fovRadians;
-            params.resetAccumulation = false; // TODO: Make this configurable via the API.
-            upscaler->upscale(worker, params);
-
-            worker->commandList->barriers(RenderBarrierStage::GRAPHICS, afterBarriers);
-        }
-
-        // Set the final render target. The ray traced image is in screen pixels, so it covers the target one to one and
-        // only the 3D viewport and its scissor are written.
+        // Set the final render target. The ray traced image (upscaled if needed) is in screen pixels, so it covers the
+        // target one to one and only the 3D viewport and its scissor are written.
         worker->commandList->setFramebuffer(colorTarget->textureFramebuffer.get());
-        worker->commandList->setViewports(RenderViewport(0.0f, 0.0f, float(rtResources->textureWidth), float(rtResources->textureHeight)));
+        worker->commandList->setViewports(RenderViewport(0.0f, 0.0f, float(rtResources->displayWidth), float(rtResources->displayHeight)));
         worker->commandList->setScissors(viewportScissorIntersection(rtScene.viewport, rtScene.scissor));
         worker->commandList->setVertexBuffers(0, nullptr, 0, nullptr);
 
@@ -2381,6 +2923,9 @@ namespace RT64 {
             worker->commandList->setGraphicsDescriptorSet(descRealFbSet, 3);
             worker->commandList->drawInstanced(3, 1, 0, 0);
         }
+
+        rtResources->writePassTimestamp(worker, RaytracingResources::PassTimestamp::Post);
+        rtResources->endPassTiming();
 
         if (diagCapture) {
             RenderTexture *finalColor = colorTarget->texture.get();
@@ -2676,6 +3221,18 @@ namespace RT64 {
 
 #   if RT_ENABLED
         RaytracingScene rtScene;
+        rtMaterialDatabase().loadOnce();
+        // Every candidate piece added since `before` comes from the draw with this signature.
+        auto stampSignature = [this](size_t before, RtEmitterSignature signature, uint64_t legacyKey) {
+            signature.legacyKey = legacyKey;
+            for (size_t c = before; c < rtFrameExtras.emissiveCandidates.size(); c++) {
+                rtFrameExtras.emissiveCandidates[c].signature = signature;
+            }
+        };
+
+        rtScene.areaMap = rtFrameExtras.areaMap = lightingSceneLight.map;
+        rtScene.areaRoom = rtFrameExtras.areaRoom = lightingSceneLight.room;
+        rtScene.areaName = rtFrameExtras.areaName = (lightingSceneLight.areaName != nullptr) ? lightingSceneLight.areaName : "";
         auto checkRtScene = [&](RaytracingScene &rtScene) {
             if (!rtScene.instanceIndices.empty()) {
                 uint32_t sceneIndex = static_cast<uint32_t>(targetDrawCall.rtScenes.size());
@@ -2698,6 +3255,27 @@ namespace RT64 {
                 rtScene.billboardsCylindrical = 0;
                 rtScene.billboardsSpherical = 0;
                 rtScene.billboardProxies = 0;
+                rtScene.emissiveCandidates.clear();
+                rtScene.emissiveCandidateDraws = 0;
+                rtScene.emissiveRejections = EmissiveRejections();
+                rtScene.emissiveDrawInfos.clear();
+                rtScene.emissiveUntexturedAdditiveDraws = 0;
+                rtScene.emissiveDepthWritingAdditiveDraws = 0;
+                rtScene.materialProbes.clear();
+                rtScene.materialKeys.clear();
+                rtScene.drawSignatures.clear();
+                rtScene.drawsWorldMismatch = 0;
+                rtScene.worldMismatchSamples.clear();
+                rtScene.materialPreviews.clear();
+                rtScene.waterDraws.clear();
+                rtScene.waterRejected = 0;
+                rtScene.waterRejects.clear();
+                rtScene.decalsTraced = 0;
+                rtScene.decalsWorldMismatch = 0;
+                rtScene.decalsAdditive = 0;
+                rtScene.decalsRasterAfter = 0;
+                rtScene.decalsFallback = 0;
+                rtScene.decalInfos.clear();
 
                 return true;
             }
@@ -2840,6 +3418,7 @@ namespace RT64 {
                 renderIndices.rdpTileCount = call.callDesc.tileCount;
                 renderIndices.highlightColor = call.debuggerDesc.highlightColor;
                 renderIndicesVector.push_back(renderIndices);
+                rtMaterialsVector.push_back(0);
 #           if RT_ENABLED
                 bool rtInstanceAdded = false;
                 RaytracingInstance rtInstance;
@@ -2910,14 +3489,55 @@ namespace RT64 {
                     // on top of the path traced image with correct occlusion.
                     if (rtProj && projLightable && (rtState != nullptr) && rtState->valid) {
                         const interop::OtherMode &otherMode = call.shaderDesc.otherMode;
-                        // Decal and translucent depth modes are layers over other surfaces. The raster draws them on
-                        // top by depth mode and draw order, so they stay rasterized after the path traced pass.
+                        // Decal and translucent depth modes are layers over other surfaces. Translucent layers (water,
+                        // effects) stay rasterized after the path traced pass. Decals (dirt paths, windows, doors, wall
+                        // details) are path traced, so they take the light and shadows of the surface they lie on: the
+                        // camera ray's coplanar tie-break picks the later draw (the decal), and shadow rays skip them,
+                        // since they would shadow their own wall. Additive decals stay rasterized after.
                         const bool layeredDepthMode = (otherMode.zMode() == ZMODE_DEC) || (otherMode.zMode() == ZMODE_XLU);
-                        if (layeredDepthMode) {
+                        const uint64_t decalKey = (call.callDesc.tileCount > 0) ? drawData.callTiles[call.callDesc.tileIndex].tmemHashOrID : 0;
+                        const uint64_t decalId = decalKey ^ (uint64_t(call.callDesc.vertexAddress) << 20) ^ (uint64_t(call.callDesc.triangleCount) * 0x9E3779B97F4A7C15ULL);
+                        const bool decalCandidate = (otherMode.zMode() == ZMODE_DEC) && otherMode.zCmp() && !usesAdditiveBlend(otherMode) && (call.callDesc.triangleCount > 0);
+                        bool decalFallback = false;
+                        if (decalCandidate) {
+                            // A decal that fell back is tried again after a while (the room may have changed, or the
+                            // rules learned its offset).
+                            auto fallbackIt = rtResources->decalRasterFallback.find(decalId);
+                            if (fallbackIt != rtResources->decalRasterFallback.end()) {
+                                if ((rtResources->diagFrame - fallbackIt->second) >= RaytracingResources::DecalFallbackRetryFrames) {
+                                    rtResources->decalRasterFallback.erase(fallbackIt);
+                                    rtResources->decalBadChecks[decalId] = 0;
+                                }
+                                else {
+                                    decalFallback = true;
+                                }
+                            }
+                        }
+                        const bool decalDraw = decalCandidate && !decalFallback;
+                        rtScene.decalsFallback += decalFallback ? 1 : 0;
+                        if (layeredDepthMode && !decalDraw) {
                             rtScene.skippedLayeredDraws++;
                         }
+                        if ((otherMode.zMode() == ZMODE_DEC) && usesAdditiveBlend(otherMode)) {
+                            rtScene.decalsAdditive++;
+                        }
 
-                        if (otherMode.zCmp() && otherMode.zUpd() && !layeredDepthMode && (call.callDesc.triangleCount > 0)) {
+                        float worldError = 0.0f;
+                        const bool worldValid = worldMatchesRaster(drawData, call.meshDesc.faceIndicesStart, call.callDesc.triangleCount * 3, worldError);
+                        if (!worldValid) {
+                            rtScene.drawsWorldMismatch++;
+                            if (rtScene.worldMismatchSamples.size() < 8) {
+                                const uint64_t key = (call.callDesc.tileCount > 0) ? drawData.callTiles[call.callDesc.tileIndex].tmemHashOrID : 0;
+                                rtScene.worldMismatchSamples.push_back({ uint32_t(renderIndicesVector.size() - 1), key, call.callDesc.vertexAddress, call.callDesc.triangleCount, worldError });
+                            }
+                        }
+
+                        if (decalDraw) {
+                            rtScene.decalsTraced += worldValid ? 1 : 0;
+                            rtScene.decalsWorldMismatch += worldValid ? 0 : 1;
+                        }
+
+                        if (worldValid && otherMode.zCmp() && (decalDraw || (otherMode.zUpd() && !layeredDepthMode)) && (call.callDesc.triangleCount > 0)) {
                             if (hitGroupVector.empty()) {
                                 const RaytracingShaderPrograms &shaderPrograms = rtState->shaderProgramsMap.find(UberShaderHash)->second;
                                 hitGroupVector.emplace_back(shaderPrograms.surface);
@@ -2930,7 +3550,9 @@ namespace RT64 {
                             const interop::RenderFlags &flags = call.shaderDesc.flags;
                             // Camera rays must skip the faces the raster culls, which the any-hit shader tests.
                             rtInstance.alphaTested = alphaTested;
-                            rtInstance.culling = flags.culling && (otherMode.cycleType() != G_CYC_COPY);
+                            // Decals are never culled: they only face the camera's way on their base anyway, and a
+                            // decal wound the other way than its base would otherwise vanish.
+                            rtInstance.culling = flags.culling && (otherMode.cycleType() != G_CYC_COPY) && !decalDraw;
                             rtInstance.opaque = !rtInstance.alphaTested && !rtInstance.culling;
                             rtScene.drawsCulling += rtInstance.culling ? 1 : 0;
 
@@ -2943,16 +3565,147 @@ namespace RT64 {
                             rtInstance.renderIndex = uint32_t(renderIndicesVector.size() - 1);
                             const RenderBottomLevelASMesh asMesh(indexRes->at(call.meshDesc.faceIndicesStart * IndexStride), worldPosRes->at(0), RenderFormat::R32_UINT, RenderFormat::R32G32B32_FLOAT, call.callDesc.triangleCount * 3, vertexCount, PosStride, rtInstance.opaque);
                             rtInstance.bottomLevelIndex = uint32_t(rtResources->pendingMeshes.size());
-                            rtInstance.queryMask = RtCameraRayMask | RtShadowRayMask;
+                            rtInstance.queryMask = decalDraw ? RtDecalRayMask : (RtCameraRayMask | RtShadowRayMask);
                             // N64 winding does not match the ray tracer's front face, so both sides must be hit.
                             rtInstance.cullDisable = true;
                             rtResources->addBottomLevelASMesh(asMesh);
                             rtInstanceAdded = true;
 
+                            // Surface material by texture, from rt_materials.json or a guess. Textures not guessed yet
+                            // this session are sampled on the GPU a few at a time.
+                            if (flags.usesTexture0 && (call.callDesc.tileCount > 0)) {
+                                RtMaterialDatabase &materials = rtMaterialDatabase();
+                                const uint64_t materialKey = drawData.callTiles[call.callDesc.tileIndex].tmemHashOrID;
+                                rtMaterialsVector.back() = materials.packedMaterial(materialKey);
+
+                                // Advanced Water Rendering for water drawn as ordinary depth writing geometry (the sea by
+                                // Limelin): a texture listed with class water, or a large flat surface whose texture
+                                // scrolls. Blue tiled floors are just as flat and wide but stand still.
+                                if (raytracingAdvancedWater() && !alphaTested && !decalDraw) {
+                                    RtMaterialEntry waterEntry;
+                                    const bool hasEntry = materials.find(materialKey, waterEntry);
+                                    const bool listedWater = hasEntry && waterEntry.user && (waterEntry.materialClass == RtMaterialClass::Water);
+                                    const bool listedOther = hasEntry && waterEntry.user && (waterEntry.materialClass != RtMaterialClass::Water);
+                                    const bool scrolls = drawScrolls(drawData, call, materialKey, rtResources->emissiveFrame);
+                                    if (listedWater || scrolls) {
+                                        const RtMaterialPlacement waterPlacement = measureMaterialPlacement(drawData, call.meshDesc.faceIndicesStart, call.callDesc.triangleCount, false);
+                                        const float waterSpan = horizontalSpan(drawData, call.meshDesc.faceIndicesStart, call.callDesc.triangleCount * 3);
+                                        const float MinOpaqueWaterSpan = 60.0f;
+                                        const bool waterShape = (waterPlacement.upFacing >= 0.9f) && (waterSpan >= MinOpaqueWaterSpan);
+                                        const char *rejectReason = nullptr;
+                                        if (!waterShape) {
+                                            rejectReason = listedWater ? "listed as water but not a large flat surface" : nullptr;
+                                        }
+                                        else if (listedOther) {
+                                            rejectReason = "scrolls, but its rt_materials.json entry has another class";
+                                        }
+                                        else {
+                                            const uint32_t waterPacked = ((waterEntry.materialClass == RtMaterialClass::Water) && (waterEntry.packed != 0)) ? waterEntry.packed :
+                                                packRtMaterial(0.06f, 0.0f, 1.0f, RtMaterialClass::Water);
+                                            rtMaterialsVector.back() = waterPacked | RtMaterialWaterPassFlag | (listedWater ? 0u : RtMaterialWaterHueGateFlag);
+                                            if (rtFrameExtras.waterDraws.size() < 64) {
+                                                rtFrameExtras.waterDraws.push_back({ materialKey, rtInstance.renderIndex, call.callDesc.triangleCount, waterSpan, waterPlacement.upFacing,
+                                                    listedWater ? "listed in rt_materials.json, opaque (path traced)" : "detected by its scrolling texture, opaque (path traced; blue or blue-green pixels only)" });
+                                            }
+                                        }
+
+                                        if ((rejectReason != nullptr) && (rtFrameExtras.waterRejects.size() < 16)) {
+                                            rtFrameExtras.waterRejects.push_back({ materialKey, rtInstance.renderIndex, waterSpan, rejectReason });
+                                            rtFrameExtras.waterRejected++;
+                                        }
+                                    }
+                                    else if (rtDiagRecording && (rtFrameExtras.waterRejects.size() < 16)) {
+                                        const RtMaterialPlacement waterPlacement = measureMaterialPlacement(drawData, call.meshDesc.faceIndicesStart, call.callDesc.triangleCount, false);
+                                        const float waterSpan = (waterPlacement.upFacing >= 0.9f) ? horizontalSpan(drawData, call.meshDesc.faceIndicesStart, call.callDesc.triangleCount * 3) : 0.0f;
+                                        if (waterSpan >= 60.0f) {
+                                            rtFrameExtras.waterRejects.push_back({ materialKey, rtInstance.renderIndex, waterSpan,
+                                                listedOther ? "large flat opaque surface listed as another class" : "large flat opaque surface, texture not scrolling and not listed as water" });
+                                        }
+                                    }
+                                }
+
+                                if (rtScene.materialKeys.size() <= rtInstance.renderIndex) {
+                                    rtScene.materialKeys.resize(rtInstance.renderIndex + 1, 0);
+                                }
+
+                                rtScene.materialKeys[rtInstance.renderIndex] = materialKey;
+                                if (rtScene.drawSignatures.size() <= rtInstance.renderIndex) {
+                                    rtScene.drawSignatures.resize(rtInstance.renderIndex + 1);
+                                }
+
+                                rtScene.drawSignatures[rtInstance.renderIndex] = drawSignature(drawData, call, materialKey, alphaTested ? RtEmitterKindCutout : RtEmitterKindOpaque);
+                                if ((rtScene.materialProbes.size() < RaytracingResources::MaterialProbeSlots) && materials.wantsProbe(materialKey, rtResources->emissiveFrame)) {
+                                    RtMaterialProbe probe;
+                                    probe.key = materialKey;
+                                    probe.renderIndex = rtInstance.renderIndex;
+                                    probe.triangleCount = call.callDesc.triangleCount;
+                                    probe.placement = measureMaterialPlacement(drawData, call.meshDesc.faceIndicesStart, call.callDesc.triangleCount, alphaTested);
+                                    const DrawCallTile &callTile = drawData.callTiles[call.callDesc.tileIndex];
+                                    probe.placement.map = lightingSceneLight.map;
+                                    probe.placement.room = lightingSceneLight.room;
+                                    probe.placement.areaName = (lightingSceneLight.areaName != nullptr) ? lightingSceneLight.areaName : "";
+                                    probe.placement.textureWidth = ((callTile.loadTile.lrs - callTile.loadTile.uls) >> 2) + 1;
+                                    probe.placement.textureHeight = ((callTile.loadTile.lrt - callTile.loadTile.ult) >> 2) + 1;
+                                    probe.placement.textureFormat = callTile.loadTile.fmt;
+                                    probe.placement.textureSize = callTile.loadTile.siz;
+                                    rtScene.materialProbes.push_back(probe);
+                                    materials.markProbePending(materialKey, rtResources->emissiveFrame);
+                                }
+
+                                // A small PNG of the texture for rt_materials.html, copied from the texture cache.
+                                const uint32_t MaxPreviewsPerFrame = 4;
+                                if ((rtScene.materialPreviews.size() < MaxPreviewsPerFrame) && (call.callDesc.tileIndex < drawData.gpuTiles.size())) {
+                                    const interop::GPUTile &gpuTile = drawData.gpuTiles[call.callDesc.tileIndex];
+                                    const uint32_t textureIndex = gpuTile.textureIndex;
+                                    Texture *texture = (!gpuTile.flags.fromCopy && !gpuTile.flags.rawTMEM && (textureIndex < textureCacheTextures.size())) ? textureCacheTextures[textureIndex] : nullptr;
+                                    if ((texture != nullptr) && (texture->texture != nullptr) && (texture->format == RenderFormat::R8G8B8A8_UNORM) &&
+                                        (texture->width > 0) && (texture->height > 0) && (texture->width <= 1024) && (texture->height <= 1024) && materials.wantsPreview(materialKey))
+                                    {
+                                        rtScene.materialPreviews.push_back({ materialKey, texture->texture.get(), texture->width, texture->height });
+                                    }
+                                }
+                            }
+
+                            // Scenery (draws at least this large) takes decals drawn before it; characters and small
+                            // objects only take decals drawn after them, so they never pick up the wall decals behind.
+                            const float MinSceneryExtent = 100.0f;
+                            rtMaterialsVector.back() &= ~RtMaterialSceneryFlag;
+                            if (!decalDraw && (drawExtent(drawData, call.meshDesc.faceIndicesStart, call.callDesc.triangleCount * 3) >= MinSceneryExtent)) {
+                                rtMaterialsVector.back() |= RtMaterialSceneryFlag;
+                            }
+
+                            if (decalDraw) {
+                                rtMaterialsVector.back() |= RtMaterialDecalFlag | (interop::Blender::usesAlphaBlend(otherMode) ? RtMaterialDecalBlendFlag : 0u);
+                                // A learned offset from the surface rides in the metalness byte, which a decal without
+                                // specular (strength byte 0) never reads.
+                                auto offsetIt = rtResources->decalOffsets.find(decalId);
+                                if ((offsetIt != rtResources->decalOffsets.end()) && (((rtMaterialsVector.back() >> 16) & 0xFF) == 0)) {
+                                    const uint32_t encoded = uint32_t(std::clamp(std::lround(offsetIt->second / RtDecalMaxOffset * 255.0f), 1L, 255L));
+                                    rtMaterialsVector.back() = (rtMaterialsVector.back() & ~(0xFFu << 8)) | (encoded << 8);
+                                }
+                                if (rtScene.decalInfos.size() < 32) {
+                                    RaytracingScene::DecalInfo info;
+                                    info.key = decalKey;
+                                    info.id = decalId;
+                                    info.renderIndex = rtInstance.renderIndex;
+                                    info.triangles = call.callDesc.triangleCount;
+                                    info.extent = horizontalSpan(drawData, call.meshDesc.faceIndicesStart, call.callDesc.triangleCount * 3);
+                                    info.blended = interop::Blender::usesAlphaBlend(otherMode);
+                                    info.alphaTested = alphaTested;
+                                    info.culling = rtInstance.culling;
+                                    info.queryMask = rtInstance.queryMask;
+                                    info.combiner[0] = call.shaderDesc.colorCombiner.L;
+                                    info.combiner[1] = call.shaderDesc.colorCombiner.H;
+                                    info.primAlpha = drawData.rdpParams[call.callDesc.callIndex].primColor.w;
+                                    info.envAlpha = drawData.rdpParams[call.callDesc.callIndex].envColor.w;
+                                    rtScene.decalInfos.push_back(info);
+                                }
+                            }
+
                             // Camera facing cutout sprites (tree canopies and the like) would cast thin shadows when the
                             // camera looks across the light. Shadow rays see a copy of the draw with those sprites turned
                             // to face the light instead, and the drawn sprites only take camera and bounce rays.
-                            if (alphaTested && (proj.pointLightCount > 0)) {
+                            if (alphaTested && !decalDraw && (proj.pointLightCount > 0)) {
                                 const ShadowCamera camera = cameraFromViewProj(drawData.modViewProjTransforms[proj.transformsIndex]);
                                 const interop::PointLight &light = proj.pointLights[0];
                                 const float lightLength = std::sqrt(light.position.x * light.position.x + light.position.y * light.position.y + light.position.z * light.position.z);
@@ -2972,6 +3725,61 @@ namespace RT64 {
                                         rtProxyAdded = true;
                                         rtScene.billboardProxies++;
                                     }
+                                }
+                            }
+
+                            // Small cutout sprites can be flames drawn with depth (candles). They only emit when the
+                            // GPU finds them bright, saturated and warm, which leaves foliage and fences dark.
+                            const uint32_t MaxCutoutSourceTriangles = 64;
+                            const float MaxCutoutSourceExtent = 20.0f;
+                            const bool additiveSurface = usesAdditiveBlend(otherMode);
+                            if (additiveSurface) {
+                                // Additive effects that write depth (fireballs and similar) are path traced surfaces,
+                                // but they glow like any additive sprite.
+                                const uint64_t key = (call.callDesc.tileCount > 0) ? drawData.callTiles[call.callDesc.tileIndex].tmemHashOrID : 0;
+                                const size_t before = rtFrameExtras.emissiveCandidates.size();
+                                const float MaxEffectExtent = 80.0f;
+                                const EmissiveDrawInfo info = collectEmissiveCandidates(drawData, call.meshDesc.faceIndicesStart, call.callDesc.triangleCount * 3, rtInstance.renderIndex, key,
+                                    EmissiveCategory::Additive, MaxEffectExtent, rtFrameExtras.emissiveCandidates, rtFrameExtras.emissiveRejections);
+                                const bool added = rtFrameExtras.emissiveCandidates.size() > before;
+                                stampSignature(before, drawSignature(drawData, call, key, RtEmitterKindAdditive), key);
+                                rtFrameExtras.emissiveCandidateDraws += added ? 1 : 0;
+                                rtFrameExtras.emissiveDepthWritingAdditiveDraws++;
+                                if (rtFrameExtras.emissiveDrawInfos.size() < 8) {
+                                    rtFrameExtras.emissiveDrawInfos.push_back(info);
+                                }
+                            }
+                            else if (decalDraw) {
+                                // Decal windows are lit and shadowed like their wall. A lit window can still give light:
+                                // its pieces are recorded as candidates, which only shine when listed in rt_emitters.json.
+                                if (flags.usesTexture0 && (call.callDesc.triangleCount <= MaxCutoutSourceTriangles)) {
+                                    const uint64_t key = (call.callDesc.tileCount > 0) ? drawData.callTiles[call.callDesc.tileIndex].tmemHashOrID : 0;
+                                    const size_t before = rtFrameExtras.emissiveCandidates.size();
+                                    const float MaxDecalSourceExtent = 60.0f;
+                                    collectEmissiveCandidates(drawData, call.meshDesc.faceIndicesStart, call.callDesc.triangleCount * 3, rtInstance.renderIndex, key,
+                                        EmissiveCategory::Blended, MaxDecalSourceExtent, rtFrameExtras.emissiveCandidates, rtFrameExtras.emissiveRejections);
+                                    stampSignature(before, drawSignature(drawData, call, key, interop::Blender::usesAlphaBlend(otherMode) ? RtEmitterKindBlended : RtEmitterKindOpaque), key);
+                                    rtFrameExtras.emissiveCandidateDraws += (rtFrameExtras.emissiveCandidates.size() > before) ? 1 : 0;
+                                }
+                            }
+                            else if (alphaTested && flags.usesTexture0 && (call.callDesc.triangleCount <= MaxCutoutSourceTriangles) &&
+                                measureMaterialPlacement(drawData, call.meshDesc.faceIndicesStart, call.callDesc.triangleCount, true).lit)
+                            {
+                                // Cutouts drawn with N64 vertex lighting are parts of models (the gold ornament on
+                                // Larapool's fountain), not flame sprites.
+                                rtFrameExtras.emissiveRejections.litCutouts++;
+                            }
+                            else if (alphaTested && flags.usesTexture0 && (call.callDesc.triangleCount <= MaxCutoutSourceTriangles)) {
+                                const uint64_t key = (call.callDesc.tileCount > 0) ? drawData.callTiles[call.callDesc.tileIndex].tmemHashOrID : 0;
+                                const size_t before = rtFrameExtras.emissiveCandidates.size();
+                                const EmissiveDrawInfo info = collectEmissiveCandidates(drawData, call.meshDesc.faceIndicesStart, call.callDesc.triangleCount * 3, rtInstance.renderIndex, key,
+                                    EmissiveCategory::Cutout, MaxCutoutSourceExtent, rtFrameExtras.emissiveCandidates, rtFrameExtras.emissiveRejections);
+                                const bool added = rtFrameExtras.emissiveCandidates.size() > before;
+                                stampSignature(before, drawSignature(drawData, call, key, RtEmitterKindCutout), key);
+                                rtFrameExtras.emissiveCandidateDraws += added ? 1 : 0;
+                                // Cutout draws are mostly foliage; only log the ones that produced candidates.
+                                if (added && (rtFrameExtras.emissiveDrawInfos.size() < 8)) {
+                                    rtFrameExtras.emissiveDrawInfos.push_back(info);
                                 }
                             }
                         }
@@ -3067,6 +3875,323 @@ namespace RT64 {
                     }
                 }
 
+#           if RT_ENABLED
+                // Effects and late opaque geometry. These checks don't depend on the draw being part of the path traced
+                // scene: battle effects, item beams and spell rocks are often drawn after the HUD split, in another
+                // framebuffer pair or through another camera, which keeps them out of the scene. World space positions
+                // don't depend on the camera, so they can still emit light and cast shadows.
+                const char *rtDiagClass = rtInstanceAdded ? "path traced" : "rasterized only";
+
+                // Advanced Water Rendering: lakes, the sea and fountains are flat, wide, alpha blended surfaces drawn
+                // without depth writes, which keeps them out of the path traced scene. They go into the acceleration
+                // structure for the water pass only (RefractionRayGen), which composites them with reflections, sun glint
+                // and shadows; their raster draw moves before the path traced pass, so it only shows where no ray hits.
+                bool waterDraw = false;
+                if (!rtInstanceAdded && rtProj && projLightable && raytracingAdvancedWater() && (rtState != nullptr) && rtState->valid &&
+                    (instanceDrawCall.type == InstanceDrawCall::Type::IndexedTriangles) && (call.callDesc.triangleCount > 0))
+                {
+                    const interop::OtherMode &otherMode = call.shaderDesc.otherMode;
+                    const uint64_t waterKey = (call.shaderDesc.flags.usesTexture0 && (call.callDesc.tileCount > 0)) ? drawData.callTiles[call.callDesc.tileIndex].tmemHashOrID : 0;
+                    RtMaterialEntry waterEntry;
+                    const bool hasEntry = (waterKey != 0) && rtMaterialDatabase().find(waterKey, waterEntry);
+                    const bool listedWater = hasEntry && waterEntry.user && (waterEntry.materialClass == RtMaterialClass::Water);
+                    const bool listedOther = hasEntry && waterEntry.user && (waterEntry.materialClass != RtMaterialClass::Water);
+                    const bool waterBlend = interop::Blender::usesAlphaBlend(otherMode) && !usesAdditiveBlend(otherMode);
+                    const bool waterDepth = otherMode.zCmp() && !otherMode.zUpd() && (otherMode.zMode() != ZMODE_DEC);
+                    if (listedWater || (waterBlend && waterDepth)) {
+                        RtMaterialPlacement waterPlacement = measureMaterialPlacement(drawData, call.meshDesc.faceIndicesStart, call.callDesc.triangleCount, false);
+                        const float waterSpan = horizontalSpan(drawData, call.meshDesc.faceIndicesStart, call.callDesc.triangleCount * 3);
+                        const interop::float4 &prim = drawData.rdpParams[call.callDesc.callIndex].primColor;
+                        // The same ripple texture tinted red is lava, or a spell's glow on the ground.
+                        const bool redTint = (prim.x > 0.5f) && (prim.x > (prim.y * 1.8f)) && (prim.x > (prim.z * 1.8f));
+                        const float MinWaterSpan = 40.0f;
+                        const float MinWaterUpFacing = 0.9f;
+                        const bool waterShape = (waterPlacement.upFacing >= MinWaterUpFacing) && (waterSpan >= MinWaterSpan);
+                        const bool detected = waterBlend && waterDepth && waterShape && !waterPlacement.lit && !redTint && !listedOther;
+                        if ((listedWater && !redTint) || detected) {
+                            float waterWorldError = 0.0f;
+                            if (worldMatchesRaster(drawData, call.meshDesc.faceIndicesStart, call.callDesc.triangleCount * 3, waterWorldError)) {
+                                waterDraw = true;
+                            }
+                        }
+                        else if (waterShape && (redTint || listedOther)) {
+                            rtFrameExtras.waterRejected++;
+                            rtDiagClass = listedOther ? "not water: its rt_materials.json entry has another class" : "not water: red tint (lava or a spell)";
+                            if (rtFrameExtras.waterRejects.size() < 16) {
+                                rtFrameExtras.waterRejects.push_back({ waterKey, uint32_t(renderIndicesVector.size() - 1), waterSpan,
+                                    listedOther ? "flat blended surface listed as another class" : "flat blended surface with a red tint (lava or a spell)" });
+                            }
+                        }
+
+                        if (waterDraw) {
+                            if (hitGroupVector.empty()) {
+                                const RaytracingShaderPrograms &shaderPrograms = rtState->shaderProgramsMap.find(UberShaderHash)->second;
+                                hitGroupVector.emplace_back(shaderPrograms.surface);
+                                hitGroupVector.emplace_back(shaderPrograms.shadow);
+                            }
+
+                            const RenderBottomLevelASMesh asMesh(indexRes->at(call.meshDesc.faceIndicesStart * IndexStride), worldPosRes->at(0), RenderFormat::R32_UINT, RenderFormat::R32G32B32_FLOAT, call.callDesc.triangleCount * 3, vertexCount, PosStride, true);
+                            RaytracingInstance waterInstance;
+                            waterInstance.renderIndex = uint32_t(renderIndicesVector.size() - 1);
+                            waterInstance.bottomLevelIndex = uint32_t(rtResources->pendingMeshes.size());
+                            waterInstance.queryMask = RtWaterRayMask;
+                            waterInstance.alphaTested = false;
+                            waterInstance.culling = false;
+                            waterInstance.opaque = true;
+                            waterInstance.cullDisable = true;
+                            rtResources->addBottomLevelASMesh(asMesh);
+                            rtFrameExtras.instances.push_back(waterInstance);
+                            rtFrameExtras.instanceIndices.push_back(uint32_t(instanceDrawCallVector.size()));
+                            // The water class defaults (rt_materials.json "water"): roughness 0.06, specular 1.
+                            rtMaterialsVector.back() = (hasEntry && (waterEntry.materialClass == RtMaterialClass::Water) && (waterEntry.packed != 0)) ? waterEntry.packed :
+                                packRtMaterial(0.06f, 0.0f, 1.0f, RtMaterialClass::Water);
+                            if (rtFrameExtras.waterDraws.size() < 64) {
+                                rtFrameExtras.waterDraws.push_back({ waterKey, waterInstance.renderIndex, call.callDesc.triangleCount, waterSpan, waterPlacement.upFacing,
+                                    listedWater ? "listed in rt_materials.json, blended (ray traced by the water pass)" : "detected: flat, wide, alpha blended, no depth write (ray traced by the water pass)" });
+                            }
+
+                            if ((waterKey != 0) && !hasEntry && (call.callDesc.tileIndex < drawData.callTiles.size())) {
+                                const DrawCallTile &callTile = drawData.callTiles[call.callDesc.tileIndex];
+                                waterPlacement.map = lightingSceneLight.map;
+                                waterPlacement.room = lightingSceneLight.room;
+                                waterPlacement.areaName = (lightingSceneLight.areaName != nullptr) ? lightingSceneLight.areaName : "";
+                                waterPlacement.textureWidth = ((callTile.loadTile.lrs - callTile.loadTile.uls) >> 2) + 1;
+                                waterPlacement.textureHeight = ((callTile.loadTile.lrt - callTile.loadTile.ult) >> 2) + 1;
+                                waterPlacement.textureFormat = callTile.loadTile.fmt;
+                                waterPlacement.textureSize = callTile.loadTile.siz;
+                                rtMaterialDatabase().noteWaterDraw(waterKey, waterPlacement);
+                            }
+
+                            // A thumbnail of the water texture for rt_materials.html.
+                            if ((waterKey != 0) && (rtFrameExtras.materialPreviews.size() < 2) && (call.callDesc.tileIndex < drawData.gpuTiles.size())) {
+                                const interop::GPUTile &gpuTile = drawData.gpuTiles[call.callDesc.tileIndex];
+                                Texture *texture = (!gpuTile.flags.fromCopy && !gpuTile.flags.rawTMEM && (gpuTile.textureIndex < textureCacheTextures.size())) ? textureCacheTextures[gpuTile.textureIndex] : nullptr;
+                                if ((texture != nullptr) && (texture->texture != nullptr) && (texture->format == RenderFormat::R8G8B8A8_UNORM) &&
+                                    (texture->width > 0) && (texture->height > 0) && (texture->width <= 1024) && (texture->height <= 1024) && rtMaterialDatabase().wantsPreview(waterKey))
+                                {
+                                    rtFrameExtras.materialPreviews.push_back({ waterKey, texture->texture.get(), texture->width, texture->height });
+                                }
+                            }
+
+                            rtDiagClass = listedWater ? "water (listed), ray traced by the water pass" : "water (detected), ray traced by the water pass";
+                        }
+                    }
+                }
+
+                float extraWorldError = 0.0f;
+                if (!waterDraw && !rtInstanceAdded && perspProj && projLightable && p.rtEnabled && (rtState != nullptr) && rtState->valid && (instanceDrawCall.type == InstanceDrawCall::Type::IndexedTriangles) &&
+                    worldMatchesRaster(drawData, call.meshDesc.faceIndicesStart, call.callDesc.triangleCount * 3, extraWorldError))
+                {
+                    const interop::OtherMode &otherMode = call.shaderDesc.otherMode;
+                    const bool additive = usesAdditiveBlend(otherMode);
+                    const bool blended = additive || interop::Blender::usesAlphaBlend(otherMode);
+                    const bool effectDraw = blended && !otherMode.zUpd() && (otherMode.zMode() != ZMODE_DEC);
+                    const bool layeredDepthMode = (otherMode.zMode() == ZMODE_DEC) || (otherMode.zMode() == ZMODE_XLU);
+                    if (effectDraw) {
+                        // Untextured effects (melee hit sparks are small flat colored triangles) are candidates too; the
+                        // GPU samples their shade and primitive color like a texture. Their key comes from the combiner
+                        // and primitive color, since there's no texture hash to tell them apart.
+                        uint64_t key = (call.callDesc.tileCount > 0) ? drawData.callTiles[call.callDesc.tileIndex].tmemHashOrID : 0;
+                        if (!call.shaderDesc.flags.usesTexture0) {
+                            rtFrameExtras.emissiveUntexturedAdditiveDraws++;
+                            const interop::float4 &prim = drawData.rdpParams[call.callDesc.callIndex].primColor;
+                            const uint32_t primBits = (uint32_t(std::clamp(prim.x, 0.0f, 1.0f) * 255.0f) << 24) | (uint32_t(std::clamp(prim.y, 0.0f, 1.0f) * 255.0f) << 16) |
+                                (uint32_t(std::clamp(prim.z, 0.0f, 1.0f) * 255.0f) << 8) | uint32_t(std::clamp(prim.w, 0.0f, 1.0f) * 255.0f);
+                            key = (uint64_t(call.shaderDesc.colorCombiner.L) << 32) ^ uint64_t(call.shaderDesc.colorCombiner.H) ^ (uint64_t(primBits) * 0x9E3779B97F4A7C15ULL);
+                        }
+
+                        const size_t before = rtFrameExtras.emissiveCandidates.size();
+                        const EmissiveRejections rejectionsBefore = rtFrameExtras.emissiveRejections;
+                        // Effects can be large volumes, like the beam around a character using an item or a big spell
+                        // projectile.
+                        const float MaxEffectExtent = additive ? 200.0f : 160.0f;
+                        // Untextured effects can't be dust or smoke textures, and sparks may be plain white: they only
+                        // need to be bright, like additive effects, and light up at once.
+                        const bool brightnessOnly = additive || !call.shaderDesc.flags.usesTexture0;
+                        const EmissiveDrawInfo info = collectEmissiveCandidates(drawData, call.meshDesc.faceIndicesStart, call.callDesc.triangleCount * 3, uint32_t(renderIndicesVector.size() - 1), key,
+                            brightnessOnly ? EmissiveCategory::Additive : EmissiveCategory::Blended, MaxEffectExtent, rtFrameExtras.emissiveCandidates, rtFrameExtras.emissiveRejections);
+                        const bool added = rtFrameExtras.emissiveCandidates.size() > before;
+                        if (!call.shaderDesc.flags.usesTexture0) {
+                            for (size_t c = before; c < rtFrameExtras.emissiveCandidates.size(); c++) {
+                                rtFrameExtras.emissiveCandidates[c].untextured = true;
+                            }
+                        }
+
+                        const uint32_t effectKind = !call.shaderDesc.flags.usesTexture0 ? RtEmitterKindUntextured : (additive ? RtEmitterKindAdditive : RtEmitterKindBlended);
+                        stampSignature(before, drawSignature(drawData, call, call.shaderDesc.flags.usesTexture0 ? key : 0, effectKind), key);
+
+                        rtFrameExtras.emissiveCandidateDraws += added ? 1 : 0;
+                        if (rtFrameExtras.emissiveDrawInfos.size() < 8) {
+                            rtFrameExtras.emissiveDrawInfos.push_back(info);
+                        }
+
+                        // Sample the effect texture once, so its candidates can be tagged with what the old heuristic
+                        // would have done.
+                        if (added && call.shaderDesc.flags.usesTexture0 && (rtFrameExtras.materialProbes.size() < (RaytracingResources::MaterialProbeSlots / 2)) &&
+                            rtMaterialDatabase().wantsProbe(key, rtResources->emissiveFrame))
+                        {
+                            RtMaterialProbe probe;
+                            probe.key = key;
+                            probe.renderIndex = uint32_t(renderIndicesVector.size() - 1);
+                            probe.triangleCount = call.callDesc.triangleCount;
+                            probe.effect = true;
+                            rtFrameExtras.materialProbes.push_back(probe);
+                            rtMaterialDatabase().markProbePending(key, rtResources->emissiveFrame);
+                        }
+
+                        // A thumbnail of the effect texture for rt_emitters.html.
+                        const uint32_t MaxEffectPreviewsPerFrame = 2;
+                        if (added && call.shaderDesc.flags.usesTexture0 && (rtFrameExtras.materialPreviews.size() < MaxEffectPreviewsPerFrame) && (call.callDesc.tileIndex < drawData.gpuTiles.size())) {
+                            const interop::GPUTile &gpuTile = drawData.gpuTiles[call.callDesc.tileIndex];
+                            Texture *texture = (!gpuTile.flags.fromCopy && !gpuTile.flags.rawTMEM && (gpuTile.textureIndex < textureCacheTextures.size())) ? textureCacheTextures[gpuTile.textureIndex] : nullptr;
+                            if ((texture != nullptr) && (texture->texture != nullptr) && (texture->format == RenderFormat::R8G8B8A8_UNORM) &&
+                                (texture->width > 0) && (texture->height > 0) && (texture->width <= 1024) && (texture->height <= 1024) && rtMaterialDatabase().wantsPreview(key))
+                            {
+                                rtFrameExtras.materialPreviews.push_back({ key, texture->texture.get(), texture->width, texture->height });
+                            }
+                        }
+
+                        rtDiagClass = "emitter candidate";
+                        if (!added) {
+                            const EmissiveRejections &after = rtFrameExtras.emissiveRejections;
+                            if (after.tooLarge > rejectionsBefore.tooLarge) {
+                                rtDiagClass = "rejected: pieces too large (over 160, additive 200)";
+                            }
+                            else if (after.groundFlat > rejectionsBefore.groundFlat) {
+                                rtDiagClass = "rejected: flat on the ground and over 40 wide";
+                            }
+                            else if (after.tooSmall > rejectionsBefore.tooSmall) {
+                                rtDiagClass = "rejected: pieces too small";
+                            }
+                            else if (after.thinLinePieces > rejectionsBefore.thinLinePieces) {
+                                rtDiagClass = "rejected: line drawing (many thin pieces)";
+                            }
+                            else {
+                                rtDiagClass = "rejected: no usable pieces";
+                            }
+                        }
+                    }
+                    else if (otherMode.zCmp() && otherMode.zUpd() && !layeredDepthMode && (call.callDesc.triangleCount > 0)) {
+                        // Opaque 3D geometry outside the path traced scene (spell rocks and the like) still casts
+                        // shadows on it. It stays rasterized, so it only takes shadow rays.
+                        const bool alphaTested = (otherMode.alphaCompare() != G_AC_NONE) || otherMode.cvgXAlpha() || blended;
+                        const RenderBottomLevelASMesh asMesh(indexRes->at(call.meshDesc.faceIndicesStart * IndexStride), worldPosRes->at(0), RenderFormat::R32_UINT, RenderFormat::R32G32B32_FLOAT, call.callDesc.triangleCount * 3, vertexCount, PosStride, !alphaTested);
+                        RaytracingInstance casterInstance;
+                        casterInstance.renderIndex = uint32_t(renderIndicesVector.size() - 1);
+                        casterInstance.bottomLevelIndex = uint32_t(rtResources->pendingMeshes.size());
+                        casterInstance.queryMask = RtShadowRayMask;
+                        casterInstance.alphaTested = alphaTested;
+                        casterInstance.culling = false;
+                        casterInstance.opaque = !alphaTested;
+                        casterInstance.cullDisable = true;
+                        rtResources->addBottomLevelASMesh(asMesh);
+                        rtFrameExtras.instances.push_back(casterInstance);
+                        rtFrameExtras.instanceIndices.push_back(uint32_t(instanceDrawCallVector.size()));
+                        rtFrameExtras.shadowOnlyCasters++;
+                        rtDiagClass = "shadow caster only";
+
+                        // Opaque geometry outside the scene is mostly effects (spell rocks, projectiles), so it's an
+                        // emitter candidate too: it only gives light when listed in rt_emitters.json.
+                        const uint64_t opaqueKey = (call.shaderDesc.flags.usesTexture0 && (call.callDesc.tileCount > 0)) ? drawData.callTiles[call.callDesc.tileIndex].tmemHashOrID : 0;
+                        const size_t opaqueBefore = rtFrameExtras.emissiveCandidates.size();
+                        EmissiveRejections opaqueRejections;
+                        collectEmissiveCandidates(drawData, call.meshDesc.faceIndicesStart, call.callDesc.triangleCount * 3, uint32_t(renderIndicesVector.size() - 1), opaqueKey,
+                            EmissiveCategory::Blended, 160.0f, rtFrameExtras.emissiveCandidates, opaqueRejections);
+                        stampSignature(opaqueBefore, drawSignature(drawData, call, opaqueKey, RtEmitterKindOpaque), opaqueKey);
+                    }
+                }
+
+                if (rtDiagRecording && !rtInstanceAdded && (rtDiagDrawRecords.size() < 250)) {
+                    const interop::OtherMode &otherMode = call.shaderDesc.otherMode;
+                    const char *projectionType = "none";
+                    switch (proj.type) {
+                    case Projection::Type::Perspective:
+                        projectionType = "perspective";
+                        break;
+                    case Projection::Type::Orthographic:
+                        projectionType = "orthographic";
+                        break;
+                    case Projection::Type::Rectangle:
+                        projectionType = "rectangle";
+                        break;
+                    case Projection::Type::Triangle:
+                        projectionType = "screen triangles";
+                        break;
+                    default:
+                        break;
+                    }
+
+                    // Why the draw isn't part of the path traced scene.
+                    const char *sceneReason = "in scene";
+                    if (!p.rtEnabled) {
+                        sceneReason = "ray tracing off";
+                    }
+                    else if (!perspProj) {
+                        sceneReason = "not perspective";
+                    }
+                    else if (!projLightable) {
+                        sceneReason = "projection not lightable";
+                    }
+                    else if (!fbPair.depthWrite) {
+                        sceneReason = "framebuffer pair without depth writes";
+                    }
+                    else if (!targetDrawCall.rtScenes.empty()) {
+                        sceneReason = "after the scene was queued (HUD split)";
+                    }
+                    else if (!rtProjCompatible) {
+                        sceneReason = "camera differs";
+                    }
+                    else if ((otherMode.zMode() == ZMODE_DEC) && otherMode.zCmp()) {
+                        const uint64_t recordKey = (call.callDesc.tileCount > 0) ? drawData.callTiles[call.callDesc.tileIndex].tmemHashOrID : 0;
+                        const uint64_t recordId = recordKey ^ (uint64_t(call.callDesc.vertexAddress) << 20) ^ (uint64_t(call.callDesc.triangleCount) * 0x9E3779B97F4A7C15ULL);
+                        float recordError = 0.0f;
+                        if (usesAdditiveBlend(otherMode)) {
+                            sceneReason = "decal, additive (stays rasterized)";
+                        }
+                        else if (rtResources->decalRasterFallback.find(recordId) != rtResources->decalRasterFallback.end()) {
+                            sceneReason = "decal, fallback: decal checks saw it mostly missed (tried again later)";
+                        }
+                        else if (!worldMatchesRaster(drawData, call.meshDesc.faceIndicesStart, call.callDesc.triangleCount * 3, recordError)) {
+                            sceneReason = "decal, world positions don't match the raster";
+                        }
+                        else {
+                            sceneReason = "decal, not taken by the path tracer";
+                        }
+                    }
+                    else if (!otherMode.zCmp() || !otherMode.zUpd()) {
+                        sceneReason = "no depth test+write";
+                    }
+
+                    float extent = 0.0f;
+                    if (call.meshDesc.faceIndicesStart + 2 < drawData.faceIndices.size()) {
+                        ShadowVec3 first = { 0.0f, 0.0f, 0.0f };
+                        bool haveFirst = false;
+                        const uint32_t indexCount = std::min(call.callDesc.triangleCount * 3, 96u);
+                        for (uint32_t i = 0; (i < indexCount) && (call.meshDesc.faceIndicesStart + i < drawData.faceIndices.size()); i++) {
+                            const interop::float4x4 *transform = nullptr;
+                            ShadowVec3 point;
+                            if (scenePosition(drawData, drawData.faceIndices[call.meshDesc.faceIndicesStart + i], point.x, point.y, point.z, transform)) {
+                                if (!haveFirst) {
+                                    first = point;
+                                    haveFirst = true;
+                                }
+
+                                extent = std::max(extent, (point - first).length());
+                            }
+                        }
+                    }
+
+                    const char *blendType = usesAdditiveBlend(otherMode) ? "additive" : (interop::Blender::usesAlphaBlend(otherMode) ? "alpha blend" : "opaque");
+                    char record[512];
+                    snprintf(record, sizeof(record), "fb pair %u, projection %u (%s, %s), draw %u: %s, z test %d write %d mode %u, %s, textured %d, alpha compare %u, cvgXAlpha %d, %u triangles, span %.1f -> %s",
+                        p.fbPairIndex, pr, projectionType, sceneReason, uint32_t(renderIndicesVector.size() - 1),
+                        (instanceDrawCall.type == InstanceDrawCall::Type::IndexedTriangles) ? "triangles" : ((instanceDrawCall.type == InstanceDrawCall::Type::RegularRect) ? "rect" : ((instanceDrawCall.type == InstanceDrawCall::Type::RawTriangles) ? "raw triangles" : "other")),
+                        otherMode.zCmp() ? 1 : 0, otherMode.zUpd() ? 1 : 0, uint32_t(otherMode.zMode() >> 10), blendType, call.shaderDesc.flags.usesTexture0 ? 1 : 0,
+                        uint32_t(otherMode.alphaCompare()), otherMode.cvgXAlpha() ? 1 : 0, call.callDesc.triangleCount, extent, rtDiagClass);
+                    rtDiagDrawRecords.emplace_back(record);
+                }
+#           endif
+
                 // Every draw is rasterized. Shadow casting draws are also recorded in the ray traced lighting scene.
                 const uint32_t instanceIndex = static_cast<uint32_t>(instanceDrawCallVector.size());
 #           if RT_ENABLED
@@ -3136,9 +4261,14 @@ namespace RT64 {
 
                     rasterScene.instanceIndices.push_back(instanceIndex);
                 }
+                else if (waterDraw) {
+                    // Drawn before the path traced pass, which replaces it wherever a ray hits.
+                    rasterScene.instanceIndices.push_back(instanceIndex);
+                }
                 else if (rasterScene.lightable && !rtScene.instanceIndices.empty()) {
                     rasterSceneAfter.instanceIndices.push_back(instanceIndex);
                     rtScene.rasterAfterDraws++;
+                    rtScene.decalsRasterAfter += (call.shaderDesc.otherMode.zMode() == ZMODE_DEC) ? 1 : 0;
                     const interop::OtherMode &otherMode = call.shaderDesc.otherMode;
                     if ((instanceDrawCall.type == InstanceDrawCall::Type::IndexedTriangles) && otherMode.zCmp() && otherMode.zUpd()) {
                         rtScene.rasterOnlyOpaqueDraws++;
@@ -3162,6 +4292,7 @@ namespace RT64 {
         bool shaderViewRtEnabled = false;
         std::vector<BufferUploader::Upload> shaderUploads = {
             { renderIndicesVector.data(), { 0, renderIndicesVector.size() }, sizeof(interop::RenderIndices), RenderBufferFlag::STORAGE, { }, &renderIndicesBuffer},
+            { rtMaterialsVector.data(), { 0, rtMaterialsVector.size() }, sizeof(uint32_t), RenderBufferFlag::STORAGE, { }, &rtMaterialsBuffer},
             { &frameParams, { 0, 1 }, sizeof(interop::FrameParams), RenderBufferFlag::CONSTANT, { }, &frameParamsBuffer}
         };
 
@@ -3182,8 +4313,16 @@ namespace RT64 {
         }
 
         if (chosenRtScene != nullptr) {
-            if (rtResources->updateOutputBuffers) {
-                rtResources->createOutputBuffers(worker, chosenRtScene->screenWidth, chosenRtScene->screenHeight);
+            // The ray tracing resolution is the screen's, or lower when the Graphics menu's upscaler is on.
+            const uint32_t screenWidth = uint32_t(std::max(chosenRtScene->screenWidth, 1));
+            const uint32_t screenHeight = uint32_t(std::max(chosenRtScene->screenHeight, 1));
+            uint32_t renderWidth = screenWidth;
+            uint32_t renderHeight = screenHeight;
+            rtResources->resolveUpscaler(worker, screenWidth, screenHeight, renderWidth, renderHeight);
+            const bool sizeChanged = (rtResources->textureWidth != renderWidth) || (rtResources->textureHeight != renderHeight) ||
+                (rtResources->displayWidth != screenWidth) || (rtResources->displayHeight != screenHeight);
+            if (rtResources->updateOutputBuffers || sizeChanged) {
+                rtResources->createOutputBuffers(worker, renderWidth, renderHeight, screenWidth, screenHeight);
                 rtResources->updateOutputBuffers = false;
             }
 
@@ -3209,6 +4348,39 @@ namespace RT64 {
             shaderUploads.push_back({ &rtResources->rtParams, { 0, 1 }, sizeof(interop::RaytracingParams), RenderBufferFlag::CONSTANT, { }, &rtResources->rtParamsBuffer });
             shaderUploads.push_back({ chosenRtScene->interleavedRasters.data(), { 0, chosenRtScene->interleavedRasters.size() }, sizeof(interop::InterleavedRaster), RenderBufferFlag::STORAGE, { }, &interleavedRastersBuffer });
 
+            // Emitters and shadow casters collected from every 3D draw of the frame.
+            RaytracingScene &scene = *chosenRtScene;
+            scene.instances.insert(scene.instances.end(), rtFrameExtras.instances.begin(), rtFrameExtras.instances.end());
+            scene.instanceIndices.insert(scene.instanceIndices.end(), rtFrameExtras.instanceIndices.begin(), rtFrameExtras.instanceIndices.end());
+            scene.shadowOnlyCasters += rtFrameExtras.shadowOnlyCasters;
+            scene.waterDraws.insert(scene.waterDraws.end(), rtFrameExtras.waterDraws.begin(), rtFrameExtras.waterDraws.end());
+            scene.waterRejected += rtFrameExtras.waterRejected;
+            scene.waterRejects.insert(scene.waterRejects.end(), rtFrameExtras.waterRejects.begin(), rtFrameExtras.waterRejects.end());
+            scene.emissiveCandidates.insert(scene.emissiveCandidates.end(), rtFrameExtras.emissiveCandidates.begin(), rtFrameExtras.emissiveCandidates.end());
+            scene.materialPreviews.insert(scene.materialPreviews.end(), rtFrameExtras.materialPreviews.begin(), rtFrameExtras.materialPreviews.end());
+            scene.materialProbes.insert(scene.materialProbes.end(), rtFrameExtras.materialProbes.begin(), rtFrameExtras.materialProbes.end());
+            if (scene.areaMap < 0) {
+                scene.areaMap = rtFrameExtras.areaMap;
+                scene.areaRoom = rtFrameExtras.areaRoom;
+                scene.areaName = rtFrameExtras.areaName;
+            }
+            scene.emissiveCandidateDraws += rtFrameExtras.emissiveCandidateDraws;
+            scene.emissiveUntexturedAdditiveDraws += rtFrameExtras.emissiveUntexturedAdditiveDraws;
+            scene.emissiveDepthWritingAdditiveDraws += rtFrameExtras.emissiveDepthWritingAdditiveDraws;
+            scene.emissiveRejections.groundFlat += rtFrameExtras.emissiveRejections.groundFlat;
+            scene.emissiveRejections.tooLarge += rtFrameExtras.emissiveRejections.tooLarge;
+            scene.emissiveRejections.tooSmall += rtFrameExtras.emissiveRejections.tooSmall;
+            scene.emissiveRejections.clusterTooLarge += rtFrameExtras.emissiveRejections.clusterTooLarge;
+            scene.emissiveRejections.thinLinePieces += rtFrameExtras.emissiveRejections.thinLinePieces;
+            scene.emissiveRejections.untexturedDraws += rtFrameExtras.emissiveRejections.untexturedDraws;
+            scene.emissiveRejections.litCutouts += rtFrameExtras.emissiveRejections.litCutouts;
+            for (const EmissiveDrawInfo &info : rtFrameExtras.emissiveDrawInfos) {
+                if (scene.emissiveDrawInfos.size() < 8) {
+                    scene.emissiveDrawInfos.push_back(info);
+                }
+            }
+
+            rtFrameExtras = RaytracingScene();
             updateRaytracingScene(worker, *chosenRtScene);
             shaderViewRtEnabled = true;
         }

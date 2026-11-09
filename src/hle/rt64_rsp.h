@@ -167,6 +167,8 @@ namespace RT64 {
         uint32_t vertexLightCount;
         uint32_t vertexLookAtIndex;
         uint32_t vertexColorPDAddress;
+        // Segmented address of the last vertex load, recorded on the draw call of the triangles that use it.
+        uint32_t lastVertexAddress = 0;
         bool fogChanged;
         bool lightsChanged;
         bool lookAtChanged;

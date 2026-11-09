@@ -13,6 +13,12 @@ option(RT64_STATIC "Build RT64 as a static library" OFF)
 
 option(RT64_SDL_WINDOW_VULKAN "Build RT64 to expect an SDL Window outside of Windows" OFF)
 
+# AMD FSR SDK (FidelityFX SDK v2.4.0): the FSR 1 shader headers, and the FSR API headers for the FSR 3.1 upscaler, which
+# loads amd_fidelityfx_loader_dx12.dll at runtime (D3D12 only).
+set(RT64_FIDELITYFX_SDK_DIR "${PROJECT_SOURCE_DIR}/../FidelityFX-SDK" CACHE PATH "Directory of the AMD FSR SDK (FidelityFX SDK)")
+option(RT64_FSR3 "Build the AMD FSR 3.1 upscaler of the ray traced image" ON)
+set(RT64_FFX_KIT "${RT64_FIDELITYFX_SDK_DIR}/Kits/FidelityFX")
+
 if (NOT ${RT64_STATIC})
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif()
@@ -374,6 +380,7 @@ set (SOURCES
     "${PROJECT_SOURCE_DIR}/src/render/rt64_raster_shader.cpp"
     "${PROJECT_SOURCE_DIR}/src/render/rt64_raster_shader_cache.cpp"
     "${PROJECT_SOURCE_DIR}/src/render/rt64_raytracing_resources.cpp"
+    "${PROJECT_SOURCE_DIR}/src/render/rt64_raytracing_materials.cpp"
     "${PROJECT_SOURCE_DIR}/src/render/rt64_raytracing_shader_cache.cpp"
     "${PROJECT_SOURCE_DIR}/src/render/rt64_render_target.cpp"
     "${PROJECT_SOURCE_DIR}/src/render/rt64_render_target_manager.cpp"
@@ -386,6 +393,9 @@ set (SOURCES
     "${PROJECT_SOURCE_DIR}/src/render/rt64_tile_processor.cpp"
     "${PROJECT_SOURCE_DIR}/src/render/rt64_transform_processor.cpp"
     "${PROJECT_SOURCE_DIR}/src/render/rt64_upscaler.cpp"
+    "${PROJECT_SOURCE_DIR}/src/render/rt64_upscaler_fsr1.cpp"
+    "${PROJECT_SOURCE_DIR}/src/render/rt64_upscaler_fsr3.cpp"
+    "${PROJECT_SOURCE_DIR}/src/render/rt64_raytracing_upscale.cpp"
     "${PROJECT_SOURCE_DIR}/src/render/rt64_vertex_processor.cpp"
     "${PROJECT_SOURCE_DIR}/src/render/rt64_vi_renderer.cpp"
 
@@ -560,10 +570,20 @@ build_pixel_shader(  rt64 "src/shaders/ComposePS.hlsl")
 build_pixel_shader(  rt64 "src/shaders/DebugPS.hlsl")
 build_pixel_shader(  rt64 "src/shaders/Im3DPS.hlsl")
 build_pixel_shader(  rt64 "src/shaders/PostProcessPS.hlsl")
+build_compute_shader(rt64 "src/shaders/FsrEasuCS.hlsl" "src/shaders/FsrEasuCS.hlsl" "-I${RT64_FFX_KIT}/api/internal/gpu" "-I${RT64_FFX_KIT}/upscalers/fsr3/include/gpu/fsr1")
+build_compute_shader(rt64 "src/shaders/FsrRcasCS.hlsl" "src/shaders/FsrRcasCS.hlsl" "-I${RT64_FFX_KIT}/api/internal/gpu" "-I${RT64_FFX_KIT}/upscalers/fsr3/include/gpu/fsr1")
+build_compute_shader(rt64 "src/shaders/UpscalerInputsCS.hlsl")
+if (WIN32 AND RT64_FSR3 AND EXISTS "${RT64_FFX_KIT}/upscalers/include/ffx_upscale.h")
+    target_compile_definitions(rt64 PRIVATE RT64_FSR3_ENABLED=1)
+    target_include_directories(rt64 PRIVATE "${RT64_FFX_KIT}/api/include" "${RT64_FFX_KIT}/upscalers/include")
+    message(STATUS "RT64 - AMD FSR 3.1 upscaler: ON (${RT64_FIDELITYFX_SDK_DIR})")
+else()
+    message(STATUS "RT64 - AMD FSR 3.1 upscaler: OFF")
+endif()
 if (WIN32)
     set(FILENAME "${PROJECT_SOURCE_DIR}/src/shaders/RtLibrary.hlsl")
     set(OUTNAME "${CMAKE_BINARY_DIR}/src/shaders/RtLibrary.hlsl")
-    set(RT_EXPORTS "PrimaryRayGen;DirectRayGen;IndirectRayGen;ReflectionRayGen;RefractionRayGen;PrimaryMiss;ShadowMiss;SurfaceClosestHit;SurfaceAnyHit;ShadowAnyHit")
+    set(RT_EXPORTS "PrimaryRayGen;DirectRayGen;IndirectRayGen;ReflectionRayGen;RefractionRayGen;EmissiveColorRayGen;PrimaryMiss;ShadowMiss;SurfaceClosestHit;SurfaceAnyHit;ShadowAnyHit")
     add_custom_command(OUTPUT ${OUTNAME}.dxil
         COMMAND ${DXC} -Wno-ignored-attributes -I${PROJECT_SOURCE_DIR}/src -D RT_SHADER -T lib_6_3 -exports "${RT_EXPORTS}" ${FILENAME} /Fo ${OUTNAME}.dxil
         DEPENDS ${FILENAME}

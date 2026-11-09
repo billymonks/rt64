@@ -5,6 +5,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <string>
 
 #include "common/rt64_emulator_configuration.h"
 #include "common/rt64_user_configuration.h"
@@ -78,6 +79,9 @@ namespace RT64 {
         std::vector<InstanceDrawCall> instanceDrawCallVector;
         std::vector<RenderPipelineProgram> hitGroupVector;
         std::vector<interop::RenderIndices> renderIndicesVector;
+        // Ray traced surface material of each render index (see RtMaterialDatabase), kept out of RenderIndices because
+        // the raster shaders share that struct's layout.
+        std::vector<uint32_t> rtMaterialsVector;
         std::vector<DynamicTextureView> dynamicTextureViewVector;
         std::vector<RenderTextureBarrier> dynamicTextureBarrierVector;
         std::unique_ptr<BufferUploader> shaderUploader;
@@ -89,6 +93,7 @@ namespace RT64 {
         RenderBuffer *testZIndexBuffer = nullptr;
         RenderIndexBufferView testZIndexBufferView;
         BufferPair renderIndicesBuffer;
+        BufferPair rtMaterialsBuffer;
         BufferPair interleavedRastersBuffer;
         uint32_t interleavedRastersCount = 0;
         BufferPair frameParamsBuffer;
@@ -118,6 +123,13 @@ namespace RT64 {
         const RenderPipelineLayout *rtPipelineLayout = nullptr;
         std::unique_ptr<RaytracingResources> rtResources;
         bool rtSupport = false;
+        // Emissive candidates and shadow casters collected from every 3D draw of the frame, including the ones outside
+        // the path traced scene (drawn after the HUD split, in another framebuffer pair or through another camera).
+        // They are merged into the chosen ray traced scene in endFramebuffers.
+        RaytracingScene rtFrameExtras;
+        // Per draw details for an on demand diagnostics capture (F9).
+        bool rtDiagRecording = false;
+        std::vector<std::string> rtDiagDrawRecords;
 #   endif
 
         struct Framebuffer {

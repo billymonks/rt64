@@ -213,6 +213,7 @@ namespace RT64 {
         uint32_t gFilteredDirectLight;
         uint32_t gFilteredIndirectLight;
         uint32_t gBlueNoise;
+        uint32_t gRtMaterials;
 
         FramebufferRendererDescriptorCommonSet(const SamplerLibrary &samplerLibrary, bool raytracing, RenderDevice *device = nullptr) {
             builder.begin();
@@ -283,6 +284,7 @@ namespace RT64 {
             gFilteredDirectLight = builder.addReadWriteTexture(65);
             gFilteredIndirectLight = builder.addReadWriteTexture(66);
             gBlueNoise = builder.addTexture(67);
+            gRtMaterials = builder.addStructuredBuffer(68);
             builder.end();
 
             if (device != nullptr) {
@@ -340,6 +342,66 @@ namespace RT64 {
             gInput = builder.addTexture(1);
             gOutput = builder.addReadWriteTexture(2);
             gSampler = builder.addImmutableSampler(3, samplerLibrary.nearest.clampClamp.get());
+            builder.end();
+
+            if (device != nullptr) {
+                create(device);
+            }
+        }
+    };
+
+    // FSR 1 EASU (FsrEasuCS) and RCAS (FsrRcasCS) of the ray traced image. RCAS doesn't sample.
+    struct FsrUpscaleDescriptorSet : RenderDescriptorSetBase {
+        uint32_t gInput;
+        uint32_t gOutput;
+        uint32_t gSampler = 0;
+
+        FsrUpscaleDescriptorSet(const SamplerLibrary &samplerLibrary, bool withSampler, RenderDevice *device = nullptr) {
+            builder.begin();
+            gInput = builder.addTexture(1);
+            gOutput = builder.addReadWriteTexture(2);
+            if (withSampler) {
+                gSampler = builder.addImmutableSampler(3, samplerLibrary.linear.clampClamp.get());
+            }
+            builder.end();
+
+            if (device != nullptr) {
+                create(device);
+            }
+        }
+    };
+
+    // Motion vectors, device depth and reactive mask for the temporal upscaler (UpscalerInputsCS).
+    struct UpscalerInputsDescriptorSet : RenderDescriptorSetBase {
+        uint32_t RtParams;
+        uint32_t gDepth;
+        uint32_t gShadingPosition;
+        uint32_t gDirectLightAccum;
+        uint32_t gPrevNormalRoughness;
+        uint32_t gDiffuse;
+        uint32_t gRefraction;
+        uint32_t gColor;
+        uint32_t gPrevColor;
+        uint32_t gMotionVectors;
+        uint32_t gDeviceDepth;
+        uint32_t gReactiveMask;
+        uint32_t gSampler;
+
+        UpscalerInputsDescriptorSet(const SamplerLibrary &samplerLibrary, RenderDevice *device = nullptr) {
+            builder.begin();
+            RtParams = builder.addConstantBuffer(0);
+            gDepth = builder.addReadWriteTexture(1);
+            gShadingPosition = builder.addReadWriteTexture(2);
+            gDirectLightAccum = builder.addReadWriteTexture(3);
+            gPrevNormalRoughness = builder.addReadWriteTexture(4);
+            gDiffuse = builder.addTexture(5);
+            gRefraction = builder.addTexture(6);
+            gColor = builder.addTexture(7);
+            gPrevColor = builder.addTexture(8);
+            gMotionVectors = builder.addReadWriteTexture(9);
+            gDeviceDepth = builder.addReadWriteTexture(10);
+            gReactiveMask = builder.addReadWriteTexture(11);
+            gSampler = builder.addImmutableSampler(12, samplerLibrary.linear.clampClamp.get());
             builder.end();
 
             if (device != nullptr) {
@@ -414,6 +476,7 @@ namespace RT64 {
         uint32_t gFlow;
         uint32_t gLumaAvg;
         uint32_t gSampler;
+        uint32_t gCoverage;
 
         PostProcessDescriptorSet(const SamplerLibrary &samplerLibrary, RenderDevice *device = nullptr) {
             builder.begin();
@@ -422,6 +485,7 @@ namespace RT64 {
             gFlow = builder.addTexture(2);
             gLumaAvg = builder.addTexture(3);
             gSampler = builder.addImmutableSampler(4, samplerLibrary.linear.clampClamp.get());
+            gCoverage = builder.addTexture(5);
             builder.end();
 
             if (device != nullptr) {

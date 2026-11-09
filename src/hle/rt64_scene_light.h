@@ -24,5 +24,11 @@ namespace RT64 {
 
         // When false, the shadow pass is skipped for this frame.
         bool enabled = true;
+
+        // Where the game is, for the material file's "first seen" notes: map and room ids (-1 when unknown) and a
+        // readable name.
+        int map = -1;
+        int room = -1;
+        const char *areaName = "";
     };
 };
