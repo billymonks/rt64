@@ -6,6 +6,7 @@
 
 #include <cassert>
 #include <cinttypes>
+#include <cmath>
 
 #include "im3d/im3d.h"
 #include "im3d/im3d_math.h"
@@ -1764,6 +1765,42 @@ namespace RT64 {
                 }
 
                 if (proj.type == Projection::Type::Perspective) {
+                    // One distant point light stands in for the directional sun, moon or room light.
+                    if (extended.sceneLight.enabled) {
+                        const SceneLight &scene = extended.sceneLight;
+                        float x = scene.direction[0];
+                        float y = scene.direction[1];
+                        float z = scene.direction[2];
+                        const float len2 = (x * x) + (y * y) + (z * z);
+                        if (len2 > 1.0e-8f) {
+                            const float inv = 1.0f / std::sqrt(len2);
+                            x *= inv;
+                            y *= inv;
+                            z *= inv;
+                        }
+                        else {
+                            x = 0.0f;
+                            y = 1.0f;
+                            z = 0.0f;
+                        }
+
+                        const float distance = (scene.lightDistance > 1.0f) ? scene.lightDistance : 50000.0f;
+                        interop::PointLight sceneLight;
+                        sceneLight.position = { x * distance, y * distance, z * distance };
+                        sceneLight.direction = { x, y, z };
+                        sceneLight.diffuseColor = { scene.lightColor[0], scene.lightColor[1], scene.lightColor[2] };
+                        sceneLight.specularColor = { scene.lightColor[0] * 0.35f, scene.lightColor[1] * 0.35f, scene.lightColor[2] * 0.35f };
+                        sceneLight.attenuationRadius = 1.0e10f;
+                        sceneLight.attenuationExponent = 1.0f;
+                        sceneLight.pointRadius = 0.0f;
+                        sceneLight.spotFalloffCosine = 1.0f;
+                        sceneLight.spotMaxCosine = 2.0f;
+                        sceneLight.shadowOffset = 8.0f;
+                        sceneLight.flickerIntensity = 0.0f;
+                        sceneLight.groupBits = 1;
+                        proj.addPointLight(sceneLight);
+                    }
+
                     // Add estimated sun light if enabled.
                     if (gameConfig.estimateSunLight) {
                         proj.addPointLight(proj.lightManager.estimatedSunLight(gameConfig.sunLightIntensity, gameConfig.sunLightDistance));

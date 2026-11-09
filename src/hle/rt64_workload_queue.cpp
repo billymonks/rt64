@@ -100,7 +100,8 @@ namespace RT64 {
 
         rspProcessor = std::make_unique<RSPProcessor>(ext.device);
         vertexProcessor = std::make_unique<VertexProcessor>(ext.device);
-        framebufferRenderer = std::make_unique<FramebufferRenderer>(ext.workloadGraphicsWorker, true, ext.createdGraphicsAPI, ext.shaderLibrary);
+        const bool raytracingSupported = ext.device->getCapabilities().raytracing;
+        framebufferRenderer = std::make_unique<FramebufferRenderer>(ext.workloadGraphicsWorker, raytracingSupported, ext.createdGraphicsAPI, ext.shaderLibrary);
         renderFramebufferManager = std::make_unique<RenderFramebufferManager>(ext.device);
         queryPool = ext.device->createQueryPool(2);
 
@@ -237,7 +238,8 @@ namespace RT64 {
         ext.sharedResources->targetRate = workloadConfig.targetRate;
 
 #   if RT_ENABLED
-        workloadConfig.raytracingEnabled = rtEnabled;
+        const bool raytracingSupported = (ext.device->getCapabilities().raytracing) && (ext.rtShaderCache != nullptr);
+        workloadConfig.raytracingEnabled = raytracingSupported && (rtEnabled || ext.sharedResources->userConfig.advancedLighting);
 
         if (workloadConfig.raytracingEnabled && (ext.sharedResources->rtConfigChanged || ext.sharedResources->fbConfigChanged || sizeChanged)) {
             // Only load the RT pipeline if the device supports it.
@@ -388,7 +390,7 @@ namespace RT64 {
                 rspProcessor->process(rspParams);
             }
 
-            const bool processWorldVertices = prevFrame.matched || ext.sharedResources->userConfig.advancedLighting;
+            const bool processWorldVertices = prevFrame.matched || ext.sharedResources->userConfig.advancedLighting || workloadConfig.raytracingEnabled;
             if (processWorldVertices) {
                 workload.resetWorldOutputBuffers();
 

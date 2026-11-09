@@ -75,6 +75,9 @@ namespace RT64 {
         const size_t srcSize = (upload.srcDataIndexRange.second - upload.srcDataIndexRange.first) * upload.srcDataStride;
         const RenderRange writtenRange(srcOffset, srcOffset + srcSize);
         uint8_t *dstData = static_cast<uint8_t *>(upload.dstPair->uploadBuffer->map());
+        if (dstData == nullptr) {
+            return;
+        }
         memcpy(dstData + srcOffset, static_cast<const uint8_t *>(upload.srcData) + srcOffset, srcSize);
         upload.dstPair->uploadBuffer->unmap(0, &writtenRange);
     }

@@ -12,7 +12,8 @@
 #include "common/rt64_math.h"
 
 #if RT_ENABLED
-#   include "res/bluenoise/LDR_64_64_64_RGB1.h"
+#   include <cstdint>
+#   include <vector>
 #endif
 
 //#define LOG_DISPLAY_LISTS
@@ -311,11 +312,24 @@ namespace RT64 {
         textureCache->setReplacementPoolMaxSize(texturePoolSize);
 
 #   if RT_ENABLED
-        // Create the blue noise texture, upload it and wait for it to finish.
+        // The original blue-noise asset is not in this tree. A stable hash fill is enough for
+        // one-sample shadows and the single indirect bounce.
+        std::vector<uint8_t> blueNoiseBytes(512u * 512u * 4u);
+        uint32_t noise = 0xA341316Cu;
+        for (size_t i = 0; i < blueNoiseBytes.size(); i += 4) {
+            noise = noise * 1664525u + 1013904223u;
+            blueNoiseBytes[i + 0] = uint8_t(noise >> 16);
+            noise = noise * 1664525u + 1013904223u;
+            blueNoiseBytes[i + 1] = uint8_t(noise >> 16);
+            noise = noise * 1664525u + 1013904223u;
+            blueNoiseBytes[i + 2] = uint8_t(noise >> 16);
+            blueNoiseBytes[i + 3] = 255;
+        }
+
         std::unique_ptr<RenderBuffer> blueNoiseUploadBuffer;
         {
             RenderWorkerExecution execution(workloadGraphicsWorker.get());
-            TextureCache::setRGBA32(&blueNoiseTexture, workloadGraphicsWorker->device, workloadGraphicsWorker->commandList.get(), LDR_64_64_64_RGB1_BGRA8, int(sizeof(LDR_64_64_64_RGB1_BGRA8)), 512, 512, 512 * 4, blueNoiseUploadBuffer);
+            TextureCache::setRGBA32(&blueNoiseTexture, workloadGraphicsWorker->device, workloadGraphicsWorker->commandList.get(), blueNoiseBytes.data(), int(blueNoiseBytes.size()), 512, 512, 512 * 4, blueNoiseUploadBuffer);
         }
 
         blueNoiseUploadBuffer.reset();

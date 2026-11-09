@@ -39,6 +39,8 @@ namespace RT64 {
     struct RasterScene {
         std::vector<uint32_t> instanceIndices;
         bool lightable = false;
+        // The ray traced scene that follows lights this scene, so the shadow map pass is skipped.
+        bool rtLit = false;
         float nativeWidth = 0.0f;
         float nativeHeight = 0.0f;
         float viewportX = 0.0f;

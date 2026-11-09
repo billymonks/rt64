@@ -16,6 +16,12 @@ namespace RT64 {
         // Brightness multiplier for a surface facing away from the light.
         float facingFloor = 0.74f;
 
+        // Direct color of the ray-traced sun, moon or room light. Already includes intensity.
+        float lightColor[3] = { 1.15f, 1.02f, 0.88f };
+
+        // Distance from the world origin to the point light that stands in for this directional light.
+        float lightDistance = 50000.0f;
+
         // When false, the shadow pass is skipped for this frame.
         bool enabled = true;
     };

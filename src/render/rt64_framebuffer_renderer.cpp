@@ -10,6 +10,7 @@
 #include "common/rt64_math.h"
 #include "hle/rt64_color_converter.h"
 #include "gbi/rt64_f3d.h"
+#include "shared/rt64_blender.h"
 #include "shared/rt64_framebuffer_params.h"
 #include "shared/rt64_raster_params.h"
 
@@ -401,7 +402,7 @@ namespace RT64 {
     // Detects a small flat sprite that turns to face the camera, either around the vertical axis or fully. When
     // it is one, its vertices are rebuilt turned around the vertical axis to face the light instead, so its
     // shadow keeps the same shape from every camera angle.
-    static bool reorientBillboard(const DrawData &drawData, uint32_t indexStart, const uint32_t *triangles, uint32_t triangleCount, const ShadowCamera &camera, const interop::float3 &worldUp, const interop::float3 &lightDirection, std::vector<ShadowVertex> &vertices) {
+    static bool reorientBillboard(const DrawData &drawData, uint32_t indexStart, const uint32_t *triangles, uint32_t triangleCount, const ShadowCamera &camera, const interop::float3 &worldUp, const interop::float3 &lightDirection, std::vector<ShadowVertex> &vertices, bool *uprightOut = nullptr) {
         vertices.clear();
         if ((triangleCount == 0) || (triangleCount > 8)) {
             return false;
@@ -492,6 +493,10 @@ namespace RT64 {
         // Upright sprites must face the camera horizontally, anything tilted must face it fully. Sloped level
         // geometry would otherwise get stood up whenever the camera happens to line up with it.
         const bool upright = std::fabs(normal.dot(up)) < 0.2f;
+        if (uprightOut != nullptr) {
+            *uprightOut = upright;
+        }
+
         if (camera.valid) {
             const float FacingCos = 0.985f;
             ShadowVec3 toCamera = camera.position - center;
@@ -577,6 +582,115 @@ namespace RT64 {
 
         for (uint32_t i = 0; i < vertices.size(); i++) {
             vertices[i].position = center + lightAcross * coordsA[i] + up * coordsB[i];
+        }
+
+        return true;
+    }
+
+    // Camera position and forward axis from a view projection in row-vector form, like findShadowCamera.
+    static ShadowCamera cameraFromViewProj(const interop::float4x4 &vp) {
+        ShadowCamera camera;
+        const int rows[3] = { 0, 1, 3 };
+        float a[3][3], b[3];
+        for (int r = 0; r < 3; r++) {
+            for (int i = 0; i < 3; i++) {
+                a[r][i] = vp.m[i][rows[r]];
+            }
+            b[r] = -vp.m[3][rows[r]];
+        }
+        const float det = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+        if (std::fabs(det) < 1e-12f) {
+            return camera;
+        }
+        auto solve = [&](int column) {
+            float m[3][3];
+            for (int r = 0; r < 3; r++) {
+                for (int i = 0; i < 3; i++) {
+                    m[r][i] = (i == column) ? b[r] : a[r][i];
+                }
+            }
+            return (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])) / det;
+        };
+        camera.position = { solve(0), solve(1), solve(2) };
+        camera.forward = { vp.m[0][3], vp.m[1][3], vp.m[2][3] };
+        const float forwardLength = camera.forward.length();
+        if (forwardLength < 1e-8f) {
+            return camera;
+        }
+        camera.forward = camera.forward * (1.0f / forwardLength);
+        camera.valid = true;
+        return camera;
+    }
+
+    // Shadow caster copy of a cutout draw for the ray tracer: every piece that reorientBillboard recognizes as a
+    // camera facing sprite is stood up facing the light; other pieces keep their positions. The copy has one vertex
+    // per index in the draw's own triangle order, so the shadow any-hit shader finds the same texels by primitive
+    // index and barycentrics. Returns false when the draw has no billboard pieces.
+    static bool buildBillboardProxy(const DrawData &drawData, uint32_t indexStart, uint32_t indexCount, const ShadowCamera &camera, const interop::float3 &lightDirection,
+        std::vector<float> &positions, uint32_t &cylindricalCount, uint32_t &sphericalCount)
+    {
+        const uint32_t MaxProxyDrawTriangles = 512;
+        const uint32_t triangleCount = indexCount / 3;
+        if ((triangleCount == 0) || (triangleCount > MaxProxyDrawTriangles) || (indexStart + indexCount > drawData.faceIndices.size())) {
+            return false;
+        }
+
+        thread_local std::vector<ShadowVec3> corners;
+        thread_local std::vector<uint32_t> componentTriangles;
+        thread_local std::vector<uint32_t> componentStarts;
+        thread_local std::vector<ShadowVertex> billboardVertices;
+        corners.resize(indexCount);
+        for (uint32_t i = 0; i < indexCount; i++) {
+            const interop::float4x4 *transform = nullptr;
+            ShadowVec3 &p = corners[i];
+            if (!scenePosition(drawData, drawData.faceIndices[indexStart + i], p.x, p.y, p.z, transform)) {
+                return false;
+            }
+        }
+
+        const interop::float3 worldUp = { 0.0f, 1.0f, 0.0f };
+        splitShadowComponents(drawData, indexStart, indexCount, componentTriangles, componentStarts);
+        bool anyBillboard = false;
+        for (size_t c = 0; c + 1 < componentStarts.size(); c++) {
+            const uint32_t *triangles = &componentTriangles[componentStarts[c]];
+            const uint32_t count = componentStarts[c + 1] - componentStarts[c];
+            bool upright = false;
+            if (!reorientBillboard(drawData, indexStart, triangles, count, camera, worldUp, lightDirection, billboardVertices, &upright)) {
+                continue;
+            }
+
+            anyBillboard = true;
+            if (upright) {
+                cylindricalCount++;
+            }
+            else {
+                sphericalCount++;
+            }
+
+            for (uint32_t t = 0; t < count; t++) {
+                for (uint32_t k = 0; k < 3; k++) {
+                    const uint32_t slot = triangles[t] * 3 + k;
+                    const uint32_t vertex = drawData.faceIndices[indexStart + slot];
+                    for (const ShadowVertex &shadowVertex : billboardVertices) {
+                        if (shadowVertex.index == vertex) {
+                            corners[slot] = shadowVertex.position;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!anyBillboard) {
+            return false;
+        }
+
+        positions.resize(size_t(indexCount) * 4);
+        for (uint32_t i = 0; i < indexCount; i++) {
+            positions[i * 4 + 0] = corners[i].x;
+            positions[i * 4 + 1] = corners[i].y;
+            positions[i * 4 + 2] = corners[i].z;
+            positions[i * 4 + 3] = 1.0f;
         }
 
         return true;
@@ -1058,11 +1172,11 @@ namespace RT64 {
             descCommonSet->setTexture(descCommonSet->gFilteredDirectLight, rtResources->filteredDirectLightTexture[1].get(), RenderTextureLayout::GENERAL);
             descCommonSet->setTexture(descCommonSet->gFilteredIndirectLight, rtResources->filteredIndirectLightTexture[1].get(), RenderTextureLayout::GENERAL);
 
-            const uint32_t hitBufferPixelCount = rtResources->textureWidth * rtResources->textureHeight * RaytracingResources::MaxHitQueries;
-            descCommonSet->setBuffer(descCommonSet->gHitVelocityDistance, rtResources->hitVelocityDistanceBuffer.get(), hitBufferPixelCount * 16, rtResources->hitVelocityDistanceBufferView.get());
-            descCommonSet->setBuffer(descCommonSet->gHitColor, rtResources->hitColorBuffer.get(), hitBufferPixelCount * 4, rtResources->hitColorBufferView.get());
-            descCommonSet->setBuffer(descCommonSet->gHitNormalFog, rtResources->hitNormalFogBuffer.get(), hitBufferPixelCount * 8, rtResources->hitNormalFogBufferView.get());
-            descCommonSet->setBuffer(descCommonSet->gHitInstanceId, rtResources->hitInstanceIdBuffer.get(), hitBufferPixelCount * 2, rtResources->hitInstanceIdBufferView.get());
+            const uint32_t hitBufferBytes = 256;
+            descCommonSet->setBuffer(descCommonSet->gHitVelocityDistance, rtResources->hitVelocityDistanceBuffer.get(), hitBufferBytes, rtResources->hitVelocityDistanceBufferView.get());
+            descCommonSet->setBuffer(descCommonSet->gHitColor, rtResources->hitColorBuffer.get(), hitBufferBytes, rtResources->hitColorBufferView.get());
+            descCommonSet->setBuffer(descCommonSet->gHitNormalFog, rtResources->hitNormalFogBuffer.get(), hitBufferBytes, rtResources->hitNormalFogBufferView.get());
+            descCommonSet->setBuffer(descCommonSet->gHitInstanceId, rtResources->hitInstanceIdBuffer.get(), hitBufferBytes, rtResources->hitInstanceIdBufferView.get());
             descCommonSet->setAccelerationStructure(descCommonSet->SceneBVH, rtResources->topLevelAS.get());
             descCommonSet->setBuffer(descCommonSet->SceneLights, rtResources->lightsBuffer.get(), sizeof(interop::PointLight) * std::max(rtResources->rtParams.lightsCount, 1U), RenderBufferStructuredView(sizeof(interop::PointLight)));
             descCommonSet->setBuffer(descCommonSet->interleavedRasters, interleavedRastersBuffer.get(), sizeof(interop::InterleavedRaster) * std::max(interleavedRastersCount, 1U), RenderBufferStructuredView(sizeof(interop::InterleavedRaster)));
@@ -1766,30 +1880,65 @@ namespace RT64 {
 
         rtParams.view = rtScene.curViewMatrix;
         rtParams.projection = rtScene.curProjMatrix;
-
-        rtParams.viewI = hlslpp::inverse(rtParams.view);
-        rtParams.projectionI = hlslpp::inverse(rtParams.projection);
         rtParams.viewProj = hlslpp::mul(rtParams.view, rtParams.projection);
+        // viewI is the inverse of the same view-projection the rasterizer uses, so rays match its pixels.
+        rtParams.viewI = hlslpp::inverse(rtParams.viewProj);
+        rtParams.projectionI = hlslpp::inverse(rtParams.projection);
         rtParams.prevViewProj = hlslpp::mul(rtScene.prevViewMatrix, rtScene.prevProjMatrix);
+        // +1 when the viewport's Y scale points down the screen. The ray shader uses this to map pixels to clip Y.
+        rtParams.nearDist = (rtScene.viewportScaleY >= 0.0f) ? 1.0f : -1.0f;
+        rtParams.farDist = 1.0e7f;
 
-        // TODO: There's probably a way to compute this without calculating the FOV/Near/Far values.
-        // Pinhole camera vectors to generate non-normalized ray direction.
-        // TODO: Make a fake target and focal distance at the midpoint of the near/far planes
-        // until the game sends that data in some way in the future.
-        const float FocalDistance = (rtParams.nearDist + rtParams.farDist) / 2.0f;
-        const hlslpp::float3 Up(0.0f, 1.0f, 0.0f);
-        const hlslpp::float3 Pos = viewPositionFrom(rtParams.viewI);
-        const hlslpp::float3 Target = Pos + viewDirectionFrom(rtParams.viewI) * FocalDistance;
-        hlslpp::float3 cameraW = hlslpp::normalize(Target - Pos) * FocalDistance;
-        hlslpp::float3 cameraU = hlslpp::normalize(hlslpp::cross(cameraW, Up));
-        hlslpp::float3 cameraV = hlslpp::normalize(hlslpp::cross(cameraU, cameraW));
-        const float ulen = FocalDistance * std::tan(rtParams.fovRadians * 0.5f);// * rtParams.aspectRatio;
-        const float vlen = FocalDistance * std::tan(rtParams.fovRadians * 0.5f);
-        cameraU = cameraU * ulen;
-        cameraV = cameraV * vlen;
-        rtParams.cameraU = hlslpp::float4(cameraU, 0.0f);
-        rtParams.cameraV = hlslpp::float4(cameraV, 0.0f);
-        rtParams.cameraW = hlslpp::float4(cameraW, 0.0f);
+        // Angle between the camera rays of two vertically neighboring pixels at the center of the viewport, using the
+        // same unprojection as the ray generation shader.
+        {
+            const hlslpp::float4x4 viewProjInverse = rtParams.viewI;
+            const float viewportH = std::max(float(rtParams.viewport.w), 1.0f);
+            auto rayDirection = [&](float pixelY) {
+                const float vpY = pixelY / viewportH;
+                const float clipY = -((-rtParams.nearDist) + (2.0f * rtParams.nearDist) * vpY);
+                const hlslpp::float4 nearH = hlslpp::mul(hlslpp::float4(0.0f, clipY, -1.0f, 1.0f), viewProjInverse);
+                const hlslpp::float4 midH = hlslpp::mul(hlslpp::float4(0.0f, clipY, 0.0f, 1.0f), viewProjInverse);
+                const hlslpp::float3 nearPos = nearH.xyz / float(nearH.w);
+                const hlslpp::float3 midPos = midH.xyz / float(midH.w);
+                return hlslpp::float3(midPos - nearPos);
+            };
+
+            const hlslpp::float3 dirA = rayDirection(viewportH * 0.5f);
+            const hlslpp::float3 dirB = rayDirection(viewportH * 0.5f + 1.0f);
+            const float lenA = float(hlslpp::length(dirA));
+            const float lenB = float(hlslpp::length(dirB));
+            float spread = 0.001f;
+            if ((lenA > 1e-12f) && (lenB > 1e-12f)) {
+                const float cosAngle = std::clamp(float(hlslpp::dot(dirA, dirB)) / (lenA * lenB), -1.0f, 1.0f);
+                spread = std::acos(cosAngle);
+            }
+
+            rtParams.pixelSpreadAngle = (std::isfinite(spread) && (spread > 1e-6f)) ? spread : 0.001f;
+        }
+
+        // cameraW carries the shadow tuning of the scene light shared with the shadow map pass: the color
+        // multiplier of a fully shadowed surface (xyz) and of a surface facing away from the light (w).
+        if (lightingSceneLight.enabled) {
+            rtParams.cameraW = { lightingSceneLight.shadowTint[0], lightingSceneLight.shadowTint[1], lightingSceneLight.shadowTint[2], lightingSceneLight.facingFloor };
+        }
+        else {
+            rtParams.cameraW = { 1.0f, 1.0f, 1.0f, 1.0f };
+        }
+
+        // cameraU/V are unused by the ray shaders. They carry the diagnostics probe: a world vertex of
+        // the first ray traced draw (w = vertex index) and the CPU camera origin (w = 1 when valid).
+        rtParams.cameraU = { rtScene.probeWorld[0], rtScene.probeWorld[1], rtScene.probeWorld[2], rtScene.probeValid ? float(rtScene.probeVertex) : -1.0f };
+        {
+            const hlslpp::float4 originH = hlslpp::mul(hlslpp::float4(0.0f, 0.0f, 1.0f, 0.0f), hlslpp::float4x4(rtParams.viewI));
+            const float originW = originH[3];
+            if (std::fabs(originW) > 1e-12f) {
+                rtParams.cameraV = { originH[0] / originW, originH[1] / originW, originH[2] / originW, 1.0f };
+            }
+            else {
+                rtParams.cameraV = { 0.0f, 0.0f, 0.0f, 0.0f };
+            }
+        }
 
         // Enable light reprojection if denoising is enabled.
 #   ifdef DI_REPROJECTION_SUPPORT
@@ -1805,9 +1954,19 @@ namespace RT64 {
         Framebuffer &framebuffer = framebufferVector[framebufferCount - 1];
         RenderDescriptorSet *descRealDepthSet = framebuffer.descRealFbSet->get();
         RenderDescriptorSet *descriptorSets[] = { descCommonSet->get(), descTextureSet->get(), descTextureSet->get(), descRealDepthSet };
-        rtResources->updateTopLevelASResources(worker, instanceDrawCallVector, rtScene.instanceIndices);
+        rtResources->updateTopLevelASResources(worker, rtScene.instances);
         rtResources->createShaderBindingTable(worker, rtState, descriptorSets, uint32_t(std::size(descriptorSets)), hitGroupVector);
         rtResources->updateLightsBuffer(worker, rtScene);
+
+        rtResources->readDiagnosticBuffers();
+        rtResources->diagFrame++;
+        const uint32_t diagFrame = rtResources->diagFrame;
+        rtResources->diagCaptureThisFrame = (diagFrame == 60) || (diagFrame == 600) || (diagFrame == 3000);
+        if (rtResources->diagCaptureThisFrame) {
+            // Tells the any-hit shaders to count rejected texels this frame.
+            rtParams.cameraV.w = 2.0f;
+            rtResources->logSceneDiagnostics(rtScene);
+        }
     }
     
     void FramebufferRenderer::submitRaytracingScene(RenderWorker *worker, RenderTarget *colorTarget, const RaytracingScene &rtScene) {
@@ -1856,6 +2015,21 @@ namespace RT64 {
 
         worker->commandList->barriers(RenderBarrierStage::COMPUTE, preDispatchBarriers, uint32_t(std::size(preDispatchBarriers)));
         
+        rtResources->prepareForDispatch(worker);
+
+        if (rtResources->topLevelAS == nullptr) {
+            static uint32_t missingCount = 0;
+            if ((missingCount++ % 600) == 0) {
+                rtDiagLog("Skipping ray dispatch because the acceleration structure is missing (%u times).", missingCount);
+            }
+            return;
+        }
+
+        const bool diagCapture = rtResources->diagCaptureThisFrame;
+        if (diagCapture) {
+            rtResources->clearDiagnosticBuffers(worker);
+        }
+
         // Bind pipeline and dispatch primary rays.
         RT64_LOG_PRINTF("Dispatching primary rays");
         Framebuffer &framebuffer = framebufferVector[framebufferCount - 1];
@@ -1876,6 +2050,8 @@ namespace RT64 {
             RenderTextureBarrier(rtResources->viewDirectionTexture.get(), RenderTextureLayout::GENERAL),
             RenderTextureBarrier(rtResources->shadingNormalTexture.get(), RenderTextureLayout::GENERAL),
             RenderTextureBarrier(rtResources->shadingSpecularTexture.get(), RenderTextureLayout::GENERAL),
+            RenderTextureBarrier(rtResources->diffuseTexture.get(), RenderTextureLayout::GENERAL),
+            RenderTextureBarrier(rtResources->depthTexture[rtResources->swapBuffers ? 1 : 0].get(), RenderTextureLayout::GENERAL),
             RenderTextureBarrier(rtResources->reflectionTexture.get(), RenderTextureLayout::GENERAL),
             RenderTextureBarrier(rtResources->refractionTexture.get(), RenderTextureLayout::GENERAL),
             RenderTextureBarrier(rtResources->normalRoughnessTexture[rtResources->swapBuffers ? 1 : 0].get(), RenderTextureLayout::GENERAL),
@@ -1892,6 +2068,11 @@ namespace RT64 {
         RT64_LOG_PRINTF("Dispatching indirect light rays");
         rtResources->shaderBindingTableInfo.groups.rayGen.startIndex = 2;
         worker->commandList->traceRays(rtResources->textureWidth, rtResources->textureHeight, 1, rtResources->shaderBindingTableBuffer->at(0), rtResources->shaderBindingTableInfo.groups);
+
+        if (diagCapture) {
+            rtResources->copyDiagnosticBuffers(worker);
+            rtResources->diagCaptureThisFrame = false;
+        }
 
         // Wait until indirect light is done before dispatching reflection or refraction rays.
         // TODO: This is only required to prevent simultaneous usage of the anyhit buffers.
@@ -2175,10 +2356,11 @@ namespace RT64 {
             worker->commandList->barriers(RenderBarrierStage::GRAPHICS, afterBarriers);
         }
 
-        // Set the final render target. Apply the same scissor and viewport that was determined for the raytracing step.
+        // Set the final render target. The ray traced image is in screen pixels, so it covers the target one to one and
+        // only the 3D viewport and its scissor are written.
         worker->commandList->setFramebuffer(colorTarget->textureFramebuffer.get());
-        worker->commandList->setViewports(rtScene.viewport);
-        worker->commandList->setScissors(rtScene.scissor);
+        worker->commandList->setViewports(RenderViewport(0.0f, 0.0f, float(rtResources->textureWidth), float(rtResources->textureHeight)));
+        worker->commandList->setScissors(viewportScissorIntersection(rtScene.viewport, rtScene.scissor));
         worker->commandList->setVertexBuffers(0, nullptr, 0, nullptr);
 
         // Draw final output.
@@ -2198,6 +2380,21 @@ namespace RT64 {
             worker->commandList->setGraphicsDescriptorSet(descTextureSet->get(), 2);
             worker->commandList->setGraphicsDescriptorSet(descRealFbSet, 3);
             worker->commandList->drawInstanced(3, 1, 0, 0);
+        }
+
+        if (diagCapture) {
+            RenderTexture *finalColor = colorTarget->texture.get();
+            RenderTextureLayout finalColorLayout = RenderTextureLayout::COLOR_WRITE;
+            if (colorTarget->usesResolve()) {
+                colorTarget->markForResolve();
+                colorTarget->resolveTarget(worker, shaderLibrary);
+                finalColor = colorTarget->resolvedTexture.get();
+                finalColorLayout = RenderTextureLayout::SHADER_READ;
+            }
+
+            rtResources->copyDiagnosticTextures(worker, finalColor, colorTarget->format, finalColorLayout, colorTarget->width / 2, colorTarget->height / 2);
+            worker->commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(colorTarget->texture.get(), RenderTextureLayout::COLOR_WRITE));
+            worker->commandList->setFramebuffer(colorTarget->textureFramebuffer.get());
         }
 
         // Mark targets for resolve.
@@ -2271,6 +2468,10 @@ namespace RT64 {
 
                 rtResources->submitBottomLevelASCreation(worker);
                 rtResources->submitTopLevelASCreation(worker);
+            }
+
+            if (outputBuffers != nullptr) {
+                rtResources->setShaderReadBuffers(outputBuffers->worldNormBuffer.buffer.get(), outputBuffers->shadedColBuffer.buffer.get());
             }
         }
 #   endif
@@ -2352,7 +2553,7 @@ namespace RT64 {
                 const RasterScene &rasterScene = targetDrawCall.rasterScenes[pair.first];
                 submitDepthAccess(worker, targetDrawCall.fbStorage, false, depthState);
                 submitRasterScene(worker, framebuffer, targetDrawCall.fbStorage, rasterScene, depthState);
-                if (rasterScene.lightable) {
+                if (rasterScene.lightable && !rasterScene.rtLit) {
                     submitSceneLighting(worker, framebuffer, targetDrawCall.fbStorage, rasterScene, depthState);
                 }
             }
@@ -2394,8 +2595,10 @@ namespace RT64 {
 
         Framebuffer &framebuffer = framebufferVector[framebufferCount - 1];
         void *paramBufferBytes = framebuffer.paramsBuffer->map();
-        memcpy(paramBufferBytes, &fbParams, sizeof(interop::FramebufferParams));
-        framebuffer.paramsBuffer->unmap();
+        if (paramBufferBytes != nullptr) {
+            memcpy(paramBufferBytes, &fbParams, sizeof(interop::FramebufferParams));
+            framebuffer.paramsBuffer->unmap();
+        }
 
         RenderTexture *backgroundColorTexture = (p.fbStorage->colorTarget != nullptr) ? p.fbStorage->colorTarget->getResolvedTexture() : dummyColorTarget.get();
         RenderTextureView *backgroundColorTextureView = (p.fbStorage->colorTarget != nullptr) ? p.fbStorage->colorTarget->getResolvedTextureView() : dummyColorTargetView.get();
@@ -2479,6 +2682,22 @@ namespace RT64 {
                 targetDrawCall.rtScenes.push_back(rtScene);
                 targetDrawCall.sceneIndices.push_back({ sceneIndex, true });
                 rtScene.instanceIndices.clear();
+                rtScene.instances.clear();
+                rtScene.skippedDraws = 0;
+                rtScene.rasterAfterDraws = 0;
+                rtScene.rasterOnlyOpaqueDraws = 0;
+                rtScene.drawsTwoCycle = 0;
+                rtScene.drawsTextureLOD = 0;
+                rtScene.drawsTexture1 = 0;
+                rtScene.drawsUntextured = 0;
+                rtScene.drawsFlatShade = 0;
+                rtScene.drawsTexturePerspectiveOff = 0;
+                rtScene.drawsCulling = 0;
+                rtScene.incompatibleProjections = 0;
+                rtScene.skippedLayeredDraws = 0;
+                rtScene.billboardsCylindrical = 0;
+                rtScene.billboardsSpherical = 0;
+                rtScene.billboardProxies = 0;
 
                 return true;
             }
@@ -2489,6 +2708,27 @@ namespace RT64 {
 
         targetDrawCall.rtScenes.clear();
 #   endif
+
+        // Submits the raster scene. In a lightable 3D view with path traced draws the order is: the raster scene
+        // (sky, background and the path traced draws, which fill the depth buffer), the path traced pass that
+        // replaces the pixels its rays hit, then the draws that are not path traced, rasterized on top.
+        RasterScene rasterSceneAfter;
+        auto flushRasterScene = [&]() {
+#       if RT_ENABLED
+            const bool rtLit = rasterScene.lightable && !rasterScene.instanceIndices.empty() && !rtScene.instanceIndices.empty();
+            rasterScene.rtLit = rtLit;
+            checkRasterScene(rasterScene);
+            rasterScene.rtLit = false;
+            if (rtLit) {
+                checkRtScene(rtScene);
+            }
+
+            rasterSceneAfter.lightable = false;
+            checkRasterScene(rasterSceneAfter);
+#       else
+            checkRasterScene(rasterScene);
+#       endif
+        };
 
         targetDrawCall.fbStorage = p.fbStorage;
         targetDrawCall.sceneIndices.clear();
@@ -2522,7 +2762,7 @@ namespace RT64 {
             // Keep the 3D view in its own scene so lighting runs before the HUD is drawn on top.
             const bool projLightable = p.advancedLighting && ((proj.type == Projection::Type::Perspective) || (proj.type == Projection::Type::Orthographic));
             if (!rasterScene.instanceIndices.empty() && (rasterScene.lightable != projLightable)) {
-                checkRasterScene(rasterScene);
+                flushRasterScene();
                 rasterScene.lightable = false;
             }
             if (projLightable) {
@@ -2542,17 +2782,24 @@ namespace RT64 {
             bool rtProj = p.rtEnabled && perspProj && fbPair.depthWrite && targetDrawCall.rtScenes.empty(); // TODO: Remove the last condition once multiple heaps per RT scene are supported.
 
             // Make sure the matrices are compatible if we're switching to a new projection.
+            // The acceleration structure holds world space positions, so draws only need to be seen through the same
+            // camera as the scene. Compare relative to the matrix size: an absolute threshold of 1e-6 let float noise
+            // in reloaded or interpolated camera matrices flip draws between path traced and rasterized every frame.
             bool rtProjCompatible = true;
             if (rtProj && (!rtScene.instanceIndices.empty())) {
-                const float Threshold = 1e-6f;
+                const float RelativeThreshold = 1e-3f;
+                const hlslpp::float4x4 zero(0.0f);
+                const float viewScale = std::max(matrixDifference(rtScene.curViewMatrix, zero), 1.0f);
+                const float projScale = std::max(matrixDifference(rtScene.curProjMatrix, zero), 1.0f);
                 const float viewMatrixDiff = matrixDifference(drawData.modViewTransforms[proj.transformsIndex], rtScene.curViewMatrix);
                 const float projMatrixDiff = matrixDifference(drawData.modProjTransforms[proj.transformsIndex], rtScene.curProjMatrix);
-                rtProjCompatible = (viewMatrixDiff < Threshold) && (projMatrixDiff < Threshold);
+                rtProjCompatible = (viewMatrixDiff < (RelativeThreshold * viewScale)) && (projMatrixDiff < (RelativeThreshold * projScale));
             }
 
             // TODO: Remove this condition once multiple heaps per RT scene are supported.
             if (rtProj && !rtProjCompatible) {
                 rtProj = false;
+                rtScene.incompatibleProjections++;
             }
 #       endif
             
@@ -2593,6 +2840,12 @@ namespace RT64 {
                 renderIndices.rdpTileCount = call.callDesc.tileCount;
                 renderIndices.highlightColor = call.debuggerDesc.highlightColor;
                 renderIndicesVector.push_back(renderIndices);
+#           if RT_ENABLED
+                bool rtInstanceAdded = false;
+                RaytracingInstance rtInstance;
+                bool rtProxyAdded = false;
+                RaytracingInstance rtProxyInstance;
+#           endif
 
                 uint32_t cycleType = call.callDesc.otherMode.cycleType();
                 if (cycleType == G_CYC_FILL) {
@@ -2651,38 +2904,81 @@ namespace RT64 {
                 }
                 else {
 #               if RT_ENABLED
-                    if (rtProj) {
-                        instanceDrawCall.type = InstanceDrawCall::Type::Raytracing;
-
-                        if (hitGroupVector.empty()) {
-                            // TODO: Support specialized shaders.
-                            //const RaytracingShaderPrograms &shaderPrograms = p.ubershadersOnly ? rtState->shaderProgramsMap.find(UberShaderHash)->second : rtState->getShaderPrograms(call.shaderDesc);
-                            const RaytracingShaderPrograms &shaderPrograms = rtState->shaderProgramsMap.find(UberShaderHash)->second;
-                            hitGroupVector.emplace_back(shaderPrograms.surface);
-                            hitGroupVector.emplace_back(shaderPrograms.shadow);
+                    // Path traced materials: draws with depth test and write in the 3D view go into the acceleration
+                    // structure and are shaded by the ray tracer. They are still rasterized first to fill the depth
+                    // buffer, so the draws that come after (decals, blended effects, flat shadows) can be rasterized
+                    // on top of the path traced image with correct occlusion.
+                    if (rtProj && projLightable && (rtState != nullptr) && rtState->valid) {
+                        const interop::OtherMode &otherMode = call.shaderDesc.otherMode;
+                        // Decal and translucent depth modes are layers over other surfaces. The raster draws them on
+                        // top by depth mode and draw order, so they stay rasterized after the path traced pass.
+                        const bool layeredDepthMode = (otherMode.zMode() == ZMODE_DEC) || (otherMode.zMode() == ZMODE_XLU);
+                        if (layeredDepthMode) {
+                            rtScene.skippedLayeredDraws++;
                         }
 
-                        auto &raytracing = instanceDrawCall.raytracing;
-                        raytracing.hitGroupIndex = 0;
-                        raytracing.cullDisable = !call.shaderDesc.flags.culling;
+                        if (otherMode.zCmp() && otherMode.zUpd() && !layeredDepthMode && (call.callDesc.triangleCount > 0)) {
+                            if (hitGroupVector.empty()) {
+                                const RaytracingShaderPrograms &shaderPrograms = rtState->shaderProgramsMap.find(UberShaderHash)->second;
+                                hitGroupVector.emplace_back(shaderPrograms.surface);
+                                hitGroupVector.emplace_back(shaderPrograms.shadow);
+                            }
 
-                        const interop::OtherMode &otherMode = call.callDesc.otherMode;
-                        raytracing.queryMask = (otherMode.zCmp() || otherMode.zUpd()) ? DepthRayQueryMask : NoDepthRayQueryMask;
-                        if (drawData.extraParams[call.callDesc.callIndex].shadowCatcherFactor > 0.0f) {
-                            raytracing.queryMask |= ShadowCatcherRayQueryMask;
+                            // Alpha tested and blended materials run the any-hit shaders, which test the texture alpha.
+                            // ALPHA_CVG_SEL alone does not make a cutout: the standard opaque render modes set it too.
+                            const bool alphaTested = (otherMode.alphaCompare() != G_AC_NONE) || otherMode.cvgXAlpha() || interop::Blender::usesAlphaBlend(otherMode);
+                            const interop::RenderFlags &flags = call.shaderDesc.flags;
+                            // Camera rays must skip the faces the raster culls, which the any-hit shader tests.
+                            rtInstance.alphaTested = alphaTested;
+                            rtInstance.culling = flags.culling && (otherMode.cycleType() != G_CYC_COPY);
+                            rtInstance.opaque = !rtInstance.alphaTested && !rtInstance.culling;
+                            rtScene.drawsCulling += rtInstance.culling ? 1 : 0;
+
+                            rtScene.drawsTwoCycle += (otherMode.cycleType() == G_CYC_2CYCLE) ? 1 : 0;
+                            rtScene.drawsTextureLOD += (otherMode.textLOD() == G_TL_LOD) ? 1 : 0;
+                            rtScene.drawsTexture1 += flags.usesTexture1 ? 1 : 0;
+                            rtScene.drawsUntextured += (!flags.usesTexture0 && !flags.usesTexture1) ? 1 : 0;
+                            rtScene.drawsFlatShade += flags.smoothShade ? 0 : 1;
+                            rtScene.drawsTexturePerspectiveOff += (otherMode.textPersp() == G_TP_NONE) ? 1 : 0;
+                            rtInstance.renderIndex = uint32_t(renderIndicesVector.size() - 1);
+                            const RenderBottomLevelASMesh asMesh(indexRes->at(call.meshDesc.faceIndicesStart * IndexStride), worldPosRes->at(0), RenderFormat::R32_UINT, RenderFormat::R32G32B32_FLOAT, call.callDesc.triangleCount * 3, vertexCount, PosStride, rtInstance.opaque);
+                            rtInstance.bottomLevelIndex = uint32_t(rtResources->pendingMeshes.size());
+                            rtInstance.queryMask = RtCameraRayMask | RtShadowRayMask;
+                            // N64 winding does not match the ray tracer's front face, so both sides must be hit.
+                            rtInstance.cullDisable = true;
+                            rtResources->addBottomLevelASMesh(asMesh);
+                            rtInstanceAdded = true;
+
+                            // Camera facing cutout sprites (tree canopies and the like) would cast thin shadows when the
+                            // camera looks across the light. Shadow rays see a copy of the draw with those sprites turned
+                            // to face the light instead, and the drawn sprites only take camera and bounce rays.
+                            if (alphaTested && (proj.pointLightCount > 0)) {
+                                const ShadowCamera camera = cameraFromViewProj(drawData.modViewProjTransforms[proj.transformsIndex]);
+                                const interop::PointLight &light = proj.pointLights[0];
+                                const float lightLength = std::sqrt(light.position.x * light.position.x + light.position.y * light.position.y + light.position.z * light.position.z);
+                                thread_local std::vector<float> proxyPositions;
+                                if (camera.valid && (lightLength > 1e-4f)) {
+                                    const interop::float3 lightDirection = { light.position.x / lightLength, light.position.y / lightLength, light.position.z / lightLength };
+                                    if (buildBillboardProxy(drawData, call.meshDesc.faceIndicesStart, call.callDesc.triangleCount * 3, camera, lightDirection,
+                                        proxyPositions, rtScene.billboardsCylindrical, rtScene.billboardsSpherical))
+                                    {
+                                        rtProxyInstance = rtInstance;
+                                        rtProxyInstance.culling = false;
+                                        rtProxyInstance.proxy = true;
+                                        rtProxyInstance.opaque = false;
+                                        rtProxyInstance.queryMask = RtShadowRayMask;
+                                        rtProxyInstance.bottomLevelIndex = rtResources->addBillboardProxyMesh(proxyPositions);
+                                        rtInstance.queryMask = RtCameraRayMask;
+                                        rtProxyAdded = true;
+                                        rtScene.billboardProxies++;
+                                    }
+                                }
+                            }
                         }
-
-                        const RenderBottomLevelASMesh asMesh(indexRes->at(call.meshDesc.faceIndicesStart *IndexStride), worldPosRes->at(0), RenderFormat::R32_UINT, RenderFormat::R32G32B32_FLOAT, call.callDesc.triangleCount * 3, vertexCount, PosStride, false);
-                        rtResources->addBottomLevelASMesh(asMesh);
-
-                        if (false) { // TODO: call.shaderDesc.flags.smoothNormal
-                            RSPSmoothNormalGenerationCB rspSmoothNormal;
-                            rspSmoothNormal.indexStart = call.meshDesc.faceIndicesStart;
-                            rspSmoothNormal.indexCount = call.callDesc.triangleCount * 3;
-                            rspSmoothNormalVector.push_back(rspSmoothNormal);
+                        else {
+                            rtScene.skippedDraws++;
                         }
                     }
-                    else 
 #               endif
                     {
                         triangles.shaderDesc = call.shaderDesc;
@@ -2771,17 +3067,10 @@ namespace RT64 {
                     }
                 }
 
-                // Determine to use the draw call either in the RT scene or the raster scene.
+                // Every draw is rasterized. Shadow casting draws are also recorded in the ray traced lighting scene.
                 const uint32_t instanceIndex = static_cast<uint32_t>(instanceDrawCallVector.size());
 #           if RT_ENABLED
-                bool rtCall = instanceDrawCall.type == InstanceDrawCall::Type::Raytracing;
-                if (rtCall) {
-                    // If the current scene is not compatible, we submit it before the raster scene.
-                    if (!rtProjCompatible) {
-                        checkRtScene(rtScene);
-                    }
-
-                    const bool addedRasterScene = checkRasterScene(rasterScene);
+                if (rtInstanceAdded) {
                     if (rtScene.instanceIndices.empty()) {
                         float projRatioScale = 1.0f / aspectRatioScale;
                         float invRatioScale = 1.0f / aspectRatioScale;
@@ -2798,11 +3087,16 @@ namespace RT64 {
                         rtScene.prevViewMatrix = drawData.prevViewTransforms[proj.transformsIndex];
                         rtScene.prevProjMatrix = drawData.prevProjTransforms[proj.transformsIndex];
 
+                        // viewportClipRatios describe the guard band used for clipping (3x the viewport in this game),
+                        // not the area the image covers. The ray image must cover exactly the viewport.
                         const auto &viewport = drawData.rspViewports[proj.transformsIndex];
-                        rtScene.viewport = convertViewportRect(viewport.rect(viewportClipRatios), p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, 0.0f, G_EX_ORIGIN_NONE, G_EX_ORIGIN_NONE);
+                        const int16_t unitClipRatios[4] = { 1, 1, -1, -1 };
+                        rtScene.viewport = convertViewportRect(viewport.rect(unitClipRatios), p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, 0.0f, G_EX_ORIGIN_NONE, G_EX_ORIGIN_NONE);
+                        rtScene.viewportScaleY = viewport.scale.y;
                         rtScene.scissor = convertFixedRect(proj.scissorRect, p.resolutionScale, p.fbWidth, invRatioScale, extOriginPercentage, 0, G_EX_ORIGIN_NONE, G_EX_ORIGIN_NONE);
 
                         rtScene.presetScene = p.presetScene;
+                        rtScene.deltaTime = p.deltaTimeMs * 0.001f;
                         rtScene.screenWidth = lround(static_cast<float>(p.fbWidth) * p.resolutionScale.x);
                         rtScene.screenHeight = lround(static_cast<float>(p.fbHeight) * p.resolutionScale.y);
 
@@ -2814,17 +3108,43 @@ namespace RT64 {
                             rtScene.pointLights = nullptr;
                             rtScene.lightCount = 0;
                         }
-                    }
-                    else if (rtProjCompatible && addedRasterScene) {
-                        targetDrawCall.sceneIndices.pop_back();
-                        const uint32_t rasterSceneIndex = static_cast<uint32_t>(targetDrawCall.rasterScenes.size() - 1);
-                        const auto &rasterScene = targetDrawCall.rasterScenes[rasterSceneIndex];
-                        rtScene.interleavedRasters.push_back({ rasterSceneIndex, rasterScene.instanceIndices.back(), 0, 0 });
+
+                        rtScene.probeValid = false;
+                        if (call.meshDesc.faceIndicesStart < drawData.faceIndices.size()) {
+                            const uint32_t probeVertex = drawData.faceIndices[call.meshDesc.faceIndicesStart];
+                            const interop::float4x4 *probeTransform = nullptr;
+                            float px, py, pz;
+                            if (scenePosition(drawData, probeVertex, px, py, pz, probeTransform)) {
+                                rtScene.probeValid = true;
+                                rtScene.probeVertex = probeVertex;
+                                rtScene.probeWorld[0] = px;
+                                rtScene.probeWorld[1] = py;
+                                rtScene.probeWorld[2] = pz;
+                                for (int c = 0; c < 4; c++) {
+                                    rtScene.probeClipRSP[c] = (probeVertex < drawData.posTransformed.size()) ? float(drawData.posTransformed[probeVertex][c]) : 0.0f;
+                                }
+                            }
+                        }
                     }
 
                     rtScene.instanceIndices.push_back(instanceIndex);
+                    rtScene.instances.push_back(rtInstance);
+                    if (rtProxyAdded) {
+                        rtScene.instanceIndices.push_back(instanceIndex);
+                        rtScene.instances.push_back(rtProxyInstance);
+                    }
+
+                    rasterScene.instanceIndices.push_back(instanceIndex);
                 }
-                else 
+                else if (rasterScene.lightable && !rtScene.instanceIndices.empty()) {
+                    rasterSceneAfter.instanceIndices.push_back(instanceIndex);
+                    rtScene.rasterAfterDraws++;
+                    const interop::OtherMode &otherMode = call.shaderDesc.otherMode;
+                    if ((instanceDrawCall.type == InstanceDrawCall::Type::IndexedTriangles) && otherMode.zCmp() && otherMode.zUpd()) {
+                        rtScene.rasterOnlyOpaqueDraws++;
+                    }
+                }
+                else
 #           endif
                 {
                     rasterScene.instanceIndices.push_back(instanceIndex);
@@ -2835,10 +3155,7 @@ namespace RT64 {
             }
         }
 
-#   if RT_ENABLED
-        checkRtScene(rtScene);
-#   endif
-        checkRasterScene(rasterScene);
+        flushRasterScene();
     }
 
     void FramebufferRenderer::endFramebuffers(RenderWorker *worker, const DrawBuffers *drawBuffers, const OutputBuffers *outputBuffers, bool rtEnabled) {

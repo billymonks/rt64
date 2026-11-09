@@ -66,6 +66,8 @@ namespace interop {
         uint lightsCount;
         uint interleavedRastersCount;
         VisualizationMode visualizationMode;
+        // Angle between the camera rays of two neighboring pixels, for texture LOD at ray hits.
+        float pixelSpreadAngle;
 
 #   ifdef HLSL_CPU
         RaytracingParams() {
@@ -102,6 +104,7 @@ namespace interop {
             maxLights = 1;
             motionBlurSamples = 32;
             visualizationMode = VisualizationMode::Final;
+            pixelSpreadAngle = 0.001f;
         }
 #   endif
     };

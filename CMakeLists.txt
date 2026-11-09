@@ -107,6 +107,7 @@ set (DXC_VS_OPTS "${DXC_COMMON_OPTS}" "-E" "VSMain" "-T vs_6_3" "-fvk-invert-y")
 set (DXC_CS_OPTS "${DXC_COMMON_OPTS}" "-E" "CSMain" "-T cs_6_3")
 set (DXC_GS_OPTS "${DXC_COMMON_OPTS}" "-E" "GSMain" "-T gs_6_3")
 set (DXC_RT_OPTS "${DXC_COMMON_OPTS}" "-D" "RT_SHADER" "-T" "lib_6_3" "-fspv-target-env=vulkan1.1spirv1.4" "-fspv-extension=SPV_KHR_ray_tracing" "-fspv-extension=SPV_EXT_descriptor_indexing")
+set (DXC_RT_DXIL_OPTS "${DXC_COMMON_OPTS}" "-D" "RT_SHADER" "-T" "lib_6_3")
 
 function(build_shader_spirv_impl TARGETOBJ FILENAME TARGET_NAME OUTNAME)
     add_custom_command(OUTPUT ${OUTNAME}.spv
@@ -372,6 +373,8 @@ set (SOURCES
     "${PROJECT_SOURCE_DIR}/src/render/rt64_projection_processor.cpp"
     "${PROJECT_SOURCE_DIR}/src/render/rt64_raster_shader.cpp"
     "${PROJECT_SOURCE_DIR}/src/render/rt64_raster_shader_cache.cpp"
+    "${PROJECT_SOURCE_DIR}/src/render/rt64_raytracing_resources.cpp"
+    "${PROJECT_SOURCE_DIR}/src/render/rt64_raytracing_shader_cache.cpp"
     "${PROJECT_SOURCE_DIR}/src/render/rt64_render_target.cpp"
     "${PROJECT_SOURCE_DIR}/src/render/rt64_render_target_manager.cpp"
     "${PROJECT_SOURCE_DIR}/src/render/rt64_render_worker.cpp"
@@ -439,6 +442,7 @@ target_link_libraries(rt64 re-spirv)
 target_link_libraries(rt64 nfd)
 target_link_libraries(rt64 libzstd_static)
 target_link_libraries(rt64 plume)
+target_compile_definitions(rt64 PUBLIC RT_ENABLED=1)
 
 # Add tools.
 add_subdirectory(src/tools/texture_hasher)
@@ -556,6 +560,23 @@ build_pixel_shader(  rt64 "src/shaders/ComposePS.hlsl")
 build_pixel_shader(  rt64 "src/shaders/DebugPS.hlsl")
 build_pixel_shader(  rt64 "src/shaders/Im3DPS.hlsl")
 build_pixel_shader(  rt64 "src/shaders/PostProcessPS.hlsl")
+if (WIN32)
+    set(FILENAME "${PROJECT_SOURCE_DIR}/src/shaders/RtLibrary.hlsl")
+    set(OUTNAME "${CMAKE_BINARY_DIR}/src/shaders/RtLibrary.hlsl")
+    set(RT_EXPORTS "PrimaryRayGen;DirectRayGen;IndirectRayGen;ReflectionRayGen;RefractionRayGen;PrimaryMiss;ShadowMiss;SurfaceClosestHit;SurfaceAnyHit;ShadowAnyHit")
+    add_custom_command(OUTPUT ${OUTNAME}.dxil
+        COMMAND ${DXC} -Wno-ignored-attributes -I${PROJECT_SOURCE_DIR}/src -D RT_SHADER -T lib_6_3 -exports "${RT_EXPORTS}" ${FILENAME} /Fo ${OUTNAME}.dxil
+        DEPENDS ${FILENAME}
+        VERBATIM)
+    add_custom_command(OUTPUT ${OUTNAME}.dxil.c
+        COMMAND file_to_c ${OUTNAME}.dxil RtLibraryBlobDXIL ${OUTNAME}.dxil.c ${OUTNAME}.dxil.h
+        DEPENDS ${OUTNAME}.dxil file_to_c
+        BYPRODUCTS ${OUTNAME}.dxil.h)
+    target_sources(rt64 PRIVATE ${OUTNAME}.dxil.c)
+endif()
+if (NOT APPLE)
+    build_shader_spirv(rt64 "src/shaders/RtLibrary.hlsl" "${DXC_RT_OPTS}")
+endif()
 
 target_include_directories(rt64 PRIVATE ${CMAKE_BINARY_DIR}/src)
 

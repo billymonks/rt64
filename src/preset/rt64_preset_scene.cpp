@@ -12,16 +12,16 @@ namespace RT64 {
     PresetScene::PresetScene() {
         estimateAmbientLight = true;
         ambientLightIntensity = 0.03f;
-        ambientBaseColor = { 0.03f, 0.03f, 0.03f };
-        ambientNoGIColor = { 0.03f, 0.03f, 0.03f };
-        eyeLightDiffuseColor = { 0.008f, 0.008f, 0.008f };
-        eyeLightSpecularColor = { 0.004f, 0.004f, 0.004f };
-        giDiffuseStrength = 1.5f;
+        ambientBaseColor = { 0.08f, 0.09f, 0.11f };
+        ambientNoGIColor = { 0.08f, 0.09f, 0.11f };
+        eyeLightDiffuseColor = { 0.03f, 0.03f, 0.035f };
+        eyeLightSpecularColor = { 0.01f, 0.01f, 0.012f };
+        giDiffuseStrength = 0.85f;
         giBackgroundStrength = 0.5f;
-        tonemapExposure = 0.35f;
-        tonemapWhite = 1.05f;
+        tonemapExposure = 0.5f;
+        tonemapWhite = 1.0f;
         tonemapBlack = 0.0f;
-        minLuminance = 0.3f;
+        minLuminance = 0.5f;
         luminanceRange = 0.0f;
         lumaUpdateTime = 1.1f;
     }
