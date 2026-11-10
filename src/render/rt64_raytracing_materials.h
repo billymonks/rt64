@@ -386,6 +386,11 @@ namespace RT64 {
     };
 
     RtMaterialDatabase &rtMaterialDatabase();
+
+    // A copy of a shipped configuration file (rt_materials.json, rt_emitters.json or rt_lights.json) compiled into the
+    // game. It's used instead of assets\materials, so a build always runs with the configuration it was built with.
+    // Call before ray tracing starts; the data must stay valid for the whole run.
+    void setRaytracingShippedConfig(const char *fileName, const char *data, size_t size);
     const char *rtMaterialClassName(RtMaterialClass materialClass);
     uint32_t packRtMaterial(float roughness, float metalness, float specular, RtMaterialClass materialClass);
 };

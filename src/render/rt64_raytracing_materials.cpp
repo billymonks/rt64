@@ -11,6 +11,8 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <mutex>
 
 #include <json/json.hpp>
 
@@ -151,6 +153,13 @@ namespace RT64 {
         const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
         if ((length > 0) && (length < MAX_PATH)) {
             return std::filesystem::path(path).parent_path();
+        }
+#   elif defined(__linux__)
+        // The working directory is usually not the game's folder on Linux (a launcher, a desktop entry).
+        std::error_code error;
+        const std::filesystem::path self = std::filesystem::read_symlink("/proc/self/exe", error);
+        if (!error && !self.empty()) {
+            return self.parent_path();
         }
 #   endif
         return std::filesystem::current_path();
@@ -338,6 +347,75 @@ namespace RT64 {
         json document = json::parse(stream, nullptr, false);
         if (document.is_discarded() || !readEntriesDocument(document, out)) {
             rtDiagLog("materials: %s is not valid material JSON, ignored", utf8(path).c_str());
+            return false;
+        }
+
+        return true;
+    }
+
+    struct EmbeddedConfig {
+        const char *data = nullptr;
+        size_t size = 0;
+    };
+
+    static std::mutex embeddedConfigMutex;
+    static std::unordered_map<std::string, EmbeddedConfig> embeddedConfigs;
+
+    void setRaytracingShippedConfig(const char *fileName, const char *data, size_t size) {
+        if ((fileName == nullptr) || (data == nullptr) || (size == 0)) {
+            return;
+        }
+
+        std::scoped_lock lock(embeddedConfigMutex);
+        embeddedConfigs[fileName] = { data, size };
+    }
+
+    // A shipped file: the copy built into the game when there is one, as it always matches this build, otherwise the
+    // file in assets\materials. origin says which was read, or why neither could be.
+    static bool parseShipped(const std::filesystem::path &path, json &document, std::string &origin) {
+        EmbeddedConfig embedded;
+        {
+            std::scoped_lock lock(embeddedConfigMutex);
+            auto it = embeddedConfigs.find(utf8(path.filename()));
+            if (it != embeddedConfigs.end()) {
+                embedded = it->second;
+            }
+        }
+
+        if (embedded.data != nullptr) {
+            document = json::parse(embedded.data, embedded.data + embedded.size, nullptr, false);
+            if (!document.is_discarded()) {
+                origin = "the copy built into the game";
+                return true;
+            }
+
+            rtDiagLog("ray tracing config: the copy of %s built into the game is not valid JSON, trying %s", utf8(path.filename()).c_str(), utf8(path).c_str());
+        }
+
+        std::ifstream stream(path);
+        if (!stream.is_open()) {
+            origin = utf8(path) + " (NOT FOUND, and no copy is built into the game)";
+            return false;
+        }
+
+        document = json::parse(stream, nullptr, false);
+        if (document.is_discarded()) {
+            origin = utf8(path) + " (NOT VALID JSON)";
+            return false;
+        }
+
+        origin = utf8(path);
+        return true;
+    }
+
+    static bool readShippedEntries(const std::filesystem::path &path, std::unordered_map<uint64_t, RtMaterialEntry> &out, std::string &origin) {
+        json document;
+        if (!parseShipped(path, document, origin)) {
+            return false;
+        }
+
+        if (!readEntriesDocument(document, out)) {
+            origin += " (NOT VALID material JSON)";
             return false;
         }
 
@@ -609,6 +687,20 @@ namespace RT64 {
         return true;
     }
 
+    static bool readShippedEmitters(const std::filesystem::path &path, std::unordered_map<uint64_t, RtEmitterEntry> &out, int *legacyGlow, std::string &origin) {
+        json document;
+        if (!parseShipped(path, document, origin)) {
+            return false;
+        }
+
+        if (!readEmittersDocument(document, out, legacyGlow)) {
+            origin += " (NOT VALID emitter JSON)";
+            return false;
+        }
+
+        return true;
+    }
+
     static ordered_json emitterJson(uint64_t id, const RtEmitterEntry &entry) {
         const RtEmitterParams &params = entry.params;
         ordered_json value = ordered_json::object();
@@ -667,15 +759,9 @@ namespace RT64 {
 
     // Reads the "lights" list of an rt_lights.json; false when the file is missing or not valid JSON. Bad entries are
     // skipped.
-    static bool readManualLights(const std::filesystem::path &path, std::vector<RtManualLight> &out, std::vector<RtRoomSetting> &settings, bool fromLocal) {
-        std::ifstream stream(path);
-        if (!stream.is_open()) {
-            return false;
-        }
-
-        json document = json::parse(stream, nullptr, false);
-        if (document.is_discarded() || !document.is_object() || !document.contains("lights") || !document["lights"].is_array()) {
-            rtDiagLog("manual lights: %s is not valid JSON or has no \"lights\" list, ignored", utf8(path).c_str());
+    static bool readManualLightsDocument(const json &document, const std::string &source, std::vector<RtManualLight> &out, std::vector<RtRoomSetting> &settings, bool fromLocal) {
+        if (!document.is_object() || !document.contains("lights") || !document["lights"].is_array()) {
+            rtDiagLog("manual lights: %s has no \"lights\" list, ignored", source.c_str());
             return false;
         }
 
@@ -699,7 +785,7 @@ namespace RT64 {
                     settings.push_back(setting);
                 }
                 catch (const std::exception &e) {
-                    rtDiagLog("manual lights: skipped a room setting in %s that couldn't be read: %s", utf8(path).c_str(), e.what());
+                    rtDiagLog("manual lights: skipped a room setting in %s that couldn't be read: %s", source.c_str(), e.what());
                 }
             }
         }
@@ -737,8 +823,37 @@ namespace RT64 {
                 out.push_back(light);
             }
             catch (const std::exception &e) {
-                rtDiagLog("manual lights: skipped a light in %s that couldn't be read: %s", utf8(path).c_str(), e.what());
+                rtDiagLog("manual lights: skipped a light in %s that couldn't be read: %s", source.c_str(), e.what());
             }
+        }
+
+        return true;
+    }
+
+    static bool readManualLights(const std::filesystem::path &path, std::vector<RtManualLight> &out, std::vector<RtRoomSetting> &settings, bool fromLocal) {
+        std::ifstream stream(path);
+        if (!stream.is_open()) {
+            return false;
+        }
+
+        json document = json::parse(stream, nullptr, false);
+        if (document.is_discarded()) {
+            rtDiagLog("manual lights: %s is not valid JSON, ignored", utf8(path).c_str());
+            return false;
+        }
+
+        return readManualLightsDocument(document, utf8(path), out, settings, fromLocal);
+    }
+
+    static bool readShippedManualLights(const std::filesystem::path &path, std::vector<RtManualLight> &out, std::vector<RtRoomSetting> &settings, std::string &origin) {
+        json document;
+        if (!parseShipped(path, document, origin)) {
+            return false;
+        }
+
+        if (!readManualLightsDocument(document, origin, out, settings, false)) {
+            origin += " (NO \"lights\" LIST)";
+            return false;
         }
 
         return true;
@@ -820,7 +935,8 @@ namespace RT64 {
 
         std::vector<RtManualLight> shippedLights;
         std::vector<RtRoomSetting> shippedSettings;
-        readManualLights(shipped, shippedLights, shippedSettings, false);
+        std::string shippedOrigin;
+        const bool shippedRead = readShippedManualLights(shipped, shippedLights, shippedSettings, shippedOrigin);
 
         // Room settings by (map, room); the local file wins.
         std::vector<RtRoomSetting> mergedSettings = localSettings;
@@ -848,9 +964,47 @@ namespace RT64 {
         }
 
         const size_t sunOff = size_t(std::count_if(mergedSettings.begin(), mergedSettings.end(), [](const RtRoomSetting &setting) { return !setting.sunAndMoon; }));
-        rtDiagLog("manual lights: %zu (%zu enabled; %zu from %s, %zu from the shipped %s); room settings: %zu (%zu with the sun and moon off)%s", merged->size(), enabled,
-            localLights.size(), authoringMode ? utf8(local).c_str() : "no Documents file", shippedLights.size(), utf8(shipped).c_str(), mergedSettings.size(), sunOff,
-            authoringMode ? (localRead ? "" : " (Documents file not found, using the shipped list)") : " (shipped configuration only)");
+        rtDiagLog("manual lights: %zu (%zu enabled; %zu from %s, %zu shipped from %s%s); room settings: %zu (%zu with the sun and moon off)%s", merged->size(), enabled,
+            localLights.size(), authoringMode ? utf8(local).c_str() : "no Documents file", shippedLights.size(), shippedOrigin.c_str(), shippedRead ? "" : " - SHIPPED LIGHTS MISSING",
+            mergedSettings.size(), sunOff, authoringMode ? (localRead ? " (authoring mode: the Documents file wins by id)" : " (authoring mode, Documents file not found, using the shipped list)") : " (player mode: shipped configuration only)");
+
+        // Enabled and total lights per area, and the rooms without the sun and moon, so a player's log shows what loaded.
+        if (!onlyIfChanged) {
+            std::map<std::pair<int, int>, std::pair<uint32_t, uint32_t>> areas;
+            for (const RtManualLight &light : *merged) {
+                auto &counts = areas[{ light.map, light.room }];
+                counts.first += light.enabled ? 1 : 0;
+                counts.second++;
+            }
+
+            std::string line;
+            uint32_t inLine = 0;
+            for (const auto &area : areas) {
+                char text[64];
+                snprintf(text, sizeof(text), "%s%d/%d %u of %u", line.empty() ? "" : ", ", area.first.first, area.first.second, area.second.first, area.second.second);
+                line += text;
+                if (++inLine == 16) {
+                    rtDiagLog("manual lights per area (map/room, room -1 = all rooms: enabled of total): %s", line.c_str());
+                    line.clear();
+                    inLine = 0;
+                }
+            }
+
+            if (!line.empty()) {
+                rtDiagLog("manual lights per area (map/room, room -1 = all rooms: enabled of total): %s", line.c_str());
+            }
+
+            std::string off;
+            for (const RtRoomSetting &setting : mergedSettings) {
+                if (!setting.sunAndMoon) {
+                    char text[32];
+                    snprintf(text, sizeof(text), "%s%d/%d", off.empty() ? "" : ", ", setting.map, setting.room);
+                    off += text;
+                }
+            }
+
+            rtDiagLog("room settings with the sun and moon off (map/room): %s", off.empty() ? "none" : off.c_str());
+        }
     }
 
     void RtMaterialDatabase::pollManualLights() {
@@ -966,15 +1120,28 @@ namespace RT64 {
     void RtMaterialDatabase::load() {
         const auto start = std::chrono::steady_clock::now();
         const std::filesystem::path directory = localDirectory();
-        // Authoring mode: the Documents\Quest64Recompiled\Ray Tracing folder exists (or the old AppData files do, which
-        // move there). The Documents files then override the shipped ones and are saved with the HTML editors and
-        // texture previews. Players don't have the folder: the shipped files in assets\materials are the whole
-        // configuration, read only, and nothing is written.
+        // Authoring mode: Documents\Quest64Recompiled\Ray Tracing has an rt_lights.json (or the old AppData files exist,
+        // which move there). The Documents files then override the shipped ones and are saved with the HTML editors and
+        // texture previews. Otherwise the shipped files in assets\materials are the whole configuration, read only, and
+        // nothing is written. The folder alone doesn't count: 1.2.0 saved rt_materials.json and rt_emitters.json there
+        // for every player, and those stale copies would override the shipped configuration. Only authors have an
+        // rt_lights.json (Eltale Studio writes it; the game never does).
         std::error_code error;
         const std::filesystem::path legacy = legacyDirectory();
-        const bool authoringMode = std::filesystem::is_directory(directory, error) ||
-            std::filesystem::exists(legacy / "rt_materials.json", error) || std::filesystem::exists(legacy / "rt_emitters.json", error);
+        const bool folderExists = std::filesystem::is_directory(directory, error);
+        const bool authorLights = std::filesystem::exists(directory / "rt_lights.json", error);
+        const bool legacyFiles = std::filesystem::exists(legacy / "rt_materials.json", error) || std::filesystem::exists(legacy / "rt_emitters.json", error);
+        const bool authoringMode = authorLights || legacyFiles;
         authoring = authoringMode;
+        if (authoringMode) {
+            rtDiagLog("ray tracing config: AUTHORING mode, because %s exists: the Documents files override the shipped ones",
+                authorLights ? utf8(directory / "rt_lights.json").c_str() : utf8(legacy).c_str());
+        }
+        else {
+            rtDiagLog("ray tracing config: PLAYER mode, reading only the shipped files in %s%s", utf8(executableDirectory() / "assets" / "materials").c_str(),
+                folderExists ? " (a Documents Ray Tracing folder without rt_lights.json, probably left by version 1.2.0, is ignored)" : "");
+        }
+
         if (authoringMode) {
             migrateLegacyFiles(directory);
         }
@@ -988,7 +1155,9 @@ namespace RT64 {
         // reach players; local user entries always win.
         std::unordered_map<uint64_t, RtMaterialEntry> seeded;
         uint32_t seededCount = 0;
-        if (readEntries(shipped, seeded)) {
+        std::string shippedOrigin;
+        const bool shippedRead = readShippedEntries(shipped, seeded, shippedOrigin);
+        if (shippedRead) {
             for (auto &pair : seeded) {
                 auto it = localEntries.find(pair.first);
                 if ((it == localEntries.end()) || (pair.second.user && !it->second.user)) {
@@ -1007,7 +1176,9 @@ namespace RT64 {
         const bool localEmittersRead = authoringMode && readEmitters(localEmitters, emitterEntries, &localLegacyGlow);
         std::unordered_map<uint64_t, RtEmitterEntry> seededEmitters;
         uint32_t seededEmitterCount = 0;
-        if (readEmitters(shippedEmitters, seededEmitters, &shippedLegacyGlow)) {
+        std::string shippedEmittersOrigin;
+        const bool shippedEmittersRead = readShippedEmitters(shippedEmitters, seededEmitters, &shippedLegacyGlow, shippedEmittersOrigin);
+        if (shippedEmittersRead) {
             for (auto &pair : seededEmitters) {
                 auto it = emitterEntries.find(pair.first);
                 if ((it == emitterEntries.end()) || (pair.second.listed && (it->second.source != "user"))) {
@@ -1080,15 +1251,17 @@ namespace RT64 {
         loaded = true;
         const double milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         if (authoringMode) {
-            rtDiagLog("materials: authoring mode (%s exists): Documents files override the shipped ones and are saved, with the HTML editors and previews",
+            rtDiagLog("materials: authoring mode: the files in %s override the shipped ones and are saved, with the HTML editors and previews",
                 utf8(directory).c_str());
-            rtDiagLog("materials: %zu entries, %zu user entries from %s (%s), %u taken from %s; emitters: %zu entries, %zu user entries from %s (%s), %u taken from the shipped list; loaded in %.1f ms on a background thread",
-                count, userCount, utf8(local).c_str(), localRead ? "read" : "not found, created on first save", seededCount, utf8(shipped).c_str(),
-                emitterCount, userEmitterCount, utf8(localEmitters).c_str(), localEmittersRead ? "read" : "not found, created on first save", seededEmitterCount, milliseconds);
+            rtDiagLog("materials: %zu entries, %zu user entries from %s (%s), %u taken from %s (%s); emitters: %zu entries, %zu user entries from %s (%s), %u taken from %s (%s); loaded in %.1f ms on a background thread",
+                count, userCount, utf8(local).c_str(), localRead ? "read" : "not found, created on first save", seededCount, shippedOrigin.c_str(), shippedRead ? "read" : "SHIPPED MATERIALS MISSING",
+                emitterCount, userEmitterCount, utf8(localEmitters).c_str(), localEmittersRead ? "read" : "not found, created on first save", seededEmitterCount,
+                shippedEmittersOrigin.c_str(), shippedEmittersRead ? "read" : "SHIPPED EMITTERS MISSING", milliseconds);
         }
         else {
-            rtDiagLog("materials: shipped configuration only (no %s, so nothing is written): %zu material entries (%zu user) from %s; %zu emitter entries (%zu user) from %s; loaded in %.1f ms on a background thread",
-                utf8(directory).c_str(), count, userCount, utf8(shipped).c_str(), emitterCount, userEmitterCount, utf8(shippedEmitters).c_str(), milliseconds);
+            rtDiagLog("materials: shipped configuration only, nothing is written: %zu material entries (%zu user) from %s (%s); %zu emitter entries (%zu user) from %s (%s); loaded in %.1f ms on a background thread",
+                count, userCount, shippedOrigin.c_str(), shippedRead ? "read" : "SHIPPED MATERIALS MISSING", emitterCount, userEmitterCount, shippedEmittersOrigin.c_str(),
+                shippedEmittersRead ? "read" : "SHIPPED EMITTERS MISSING", milliseconds);
         }
     }
 
