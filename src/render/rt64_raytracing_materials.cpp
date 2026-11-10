@@ -757,6 +757,10 @@ namespace RT64 {
     static const bool kManualLightsHotReload = true;
     static const std::chrono::milliseconds kManualLightsPollInterval(1000);
 
+    // rt_materials.json's user entries are read again when another program (Eltale Studio, the HTML editor) changes it,
+    // so an edited material shows in the game within a second.
+    static const bool kMaterialsHotReload = true;
+
     // Reads the "lights" list of an rt_lights.json; false when the file is missing or not valid JSON. Bad entries are
     // skipped.
     static bool readManualLightsDocument(const json &document, const std::string &source, std::vector<RtManualLight> &out, std::vector<RtRoomSetting> &settings, bool fromLocal) {
@@ -1007,24 +1011,91 @@ namespace RT64 {
         }
     }
 
-    void RtMaterialDatabase::pollManualLights() {
-        if (!kManualLightsHotReload || !loaded || !authoring) {
+    void RtMaterialDatabase::pollEditedFiles() {
+        if ((!kManualLightsHotReload && !kMaterialsHotReload) || !loaded || !authoring) {
             return;
         }
 
         const auto now = std::chrono::steady_clock::now();
-        if (((now - manualLightsLastPoll) < kManualLightsPollInterval) || manualLightsCheckPending.exchange(true)) {
+        if (((now - editedFilesLastPoll) < kManualLightsPollInterval) || editedFilesCheckPending.exchange(true)) {
             return;
         }
 
-        manualLightsLastPoll = now;
+        editedFilesLastPoll = now;
         post([this]() {
             struct ClearPending {
                 std::atomic<bool> &flag;
                 ~ClearPending() { flag = false; }
-            } clearPending{ manualLightsCheckPending };
-            loadManualLights(true);
+            } clearPending{ editedFilesCheckPending };
+            if (kManualLightsHotReload) {
+                loadManualLights(true);
+            }
+
+            if (kMaterialsHotReload) {
+                loadEditedMaterials();
+            }
         });
+    }
+
+    void RtMaterialDatabase::loadEditedMaterials() {
+        std::string path;
+        std::filesystem::file_time_type knownTime;
+        {
+            std::scoped_lock lock(mutex);
+            path = localPath;
+            knownTime = materialsWriteTime;
+        }
+
+        if (path.empty()) {
+            return;
+        }
+
+        const std::filesystem::path jsonPath = fromUtf8(path);
+        std::error_code error;
+        const std::filesystem::file_time_type writeTime = std::filesystem::last_write_time(jsonPath, error);
+        if (error || (writeTime == knownTime)) {
+            return;
+        }
+
+        std::unordered_map<uint64_t, RtMaterialEntry> onDisk;
+        const bool read = readEntries(jsonPath, onDisk);
+        uint32_t changed = 0;
+        {
+            std::scoped_lock lock(mutex);
+            materialsWriteTime = writeTime;
+            // Only the user's entries come from the file: the game's guesses in memory are as new as the file's.
+            for (auto &pair : onDisk) {
+                if (!read || !pair.second.user) {
+                    continue;
+                }
+
+                auto it = entries.find(pair.first);
+                if (it != entries.end()) {
+                    const RtMaterialEntry &known = it->second;
+                    const bool same = known.user && (known.packed == pair.second.packed) && (known.emission == pair.second.emission) &&
+                        (known.emissionFromTexture == pair.second.emissionFromTexture) && (known.label == pair.second.label) &&
+                        std::equal(std::begin(known.emissionColor), std::end(known.emissionColor), std::begin(pair.second.emissionColor));
+                    if (same) {
+                        continue;
+                    }
+
+                    if (pair.second.preview.empty()) {
+                        pair.second.preview = known.preview;
+                    }
+                }
+
+                entries[pair.first] = pair.second;
+                changed++;
+            }
+        }
+
+        if (!read) {
+            // Probably broken by hand: the materials in memory stay until the next change.
+            rtDiagLog("materials: %s changed but couldn't be read, kept the materials in memory", path.c_str());
+        }
+        else if (changed > 0) {
+            rtDiagLog("materials: %u user entries changed in %s, applied", changed, path.c_str());
+        }
     }
 
     RtMaterialDatabase &rtMaterialDatabase() {
@@ -1215,6 +1286,10 @@ namespace RT64 {
             std::scoped_lock lock(mutex);
             // Without authoring there's no local file: the paths stay empty, so nothing is saved or previewed.
             localPath = authoringMode ? utf8(local) : std::string();
+            if (localRead) {
+                materialsWriteTime = std::filesystem::last_write_time(local, error);
+            }
+
             previewDirectory = authoringMode ? utf8(directory / "rt_materials") : std::string();
             for (auto &pair : localEntries) {
                 entries.emplace(pair.first, pair.second);
@@ -1282,7 +1357,7 @@ button{background:#3a3d41;color:#ddd;border:1px solid #555;padding:4px 10px;curs
 #status{margin-left:12px;color:#f0c040}input,select{background:#2d2d2d;color:#ddd;border:1px solid #555}
 </style></head><body>
 <div id="bar"><h1>%TITLE%</h1>
-<p>Edit any row, then press Save. Changes take effect the next time the game starts (it reads the file once at boot).
+<p>Edit any row, then press Save. Material changes show in the running game within a second; emitter changes take effect the next time the game starts.
 Save writes the file directly in Edge or Chrome: the first time, open <code>%FOLDER%\%FILE%</code> (the folder this page is in, not Documents itself); later saves reuse it. Save refuses any other file.
 In other browsers use Download JSON and replace that file. Edited rows are marked "source": "user" and the game never overwrites them.</p>
 <button class="primary" id="save">Save</button> <button id="download">Download JSON</button> <button id="load">Load JSON</button>
@@ -1508,9 +1583,14 @@ fillAreas();render();
         const std::filesystem::path jsonPath = fromUtf8(path);
         const std::filesystem::path emittersPath = jsonPath.parent_path() / "rt_emitters.json";
 
-        // The user may have saved edits from the HTML editors while the game ran: entries the files mark as the
-        // user's replace the game's before anything is written.
+        // The user may have saved edits from the HTML editors or Eltale Studio while the game ran: entries the files
+        // mark as the user's replace the game's before anything is written. They're applied in memory first, as the
+        // write below hides the change from the next poll.
         // The legacy glow switch is only ever changed by the user, so the file's value is kept.
+        if (kMaterialsHotReload) {
+            loadEditedMaterials();
+        }
+
         int diskLegacyGlow = -1;
         std::unordered_map<uint64_t, RtMaterialEntry> snapshot = snapshotIn;
         std::unordered_map<uint64_t, RtEmitterEntry> emitterSnapshot = emitterSnapshotIn;
@@ -1593,12 +1673,13 @@ fillAreas();render();
         ordered_json document = ordered_json::object();
         document["_readme"] = {
             "Ray traced surface materials, one entry per texture, grouped by where each was first seen.",
-            "Easiest: open rt_materials.html next to this file in Edge or Chrome, edit there and press Save.",
+            "Easiest: click the surface in Eltale Studio (Rooms or Characters, Alt+click), or open rt_materials.html next to",
+            "this file in Edge or Chrome, edit there and press Save.",
             "class: matte, sprite, grass, dirt, wood, cloth, skin, stone, polished, metal or water.",
             "roughness 0 (mirror) to 1 (matte); metalness 0 (plastic, stone) to 1 (metal); specular 0 (none) to 1 (full).",
             "Set source to \"user\" on an entry you edit, or the game may replace it with a new guess.",
-            "The file is read when the game starts. Only key, class, roughness, metalness, specular and source matter;",
-            "the other fields are notes the game fills in."
+            "The game reads the file when it starts, and its user entries again within a second of it changing. Only key,",
+            "label, class, roughness, metalness, specular, emission and source matter; the other fields are notes the game fills in."
         };
         // Where the game reads the file and when it last wrote it: the editor page checks that it saves into this
         // file, and warns when the file on disk is newer than the page.
@@ -1630,6 +1711,14 @@ fillAreas();render();
 
         const std::string materialsText = document.dump(2) + "\n";
         writeAtomically(jsonPath, materialsText);
+        {
+            std::error_code timeError;
+            const std::filesystem::file_time_type writeTime = std::filesystem::last_write_time(jsonPath, timeError);
+            std::scoped_lock lock(mutex);
+            if (!timeError) {
+                materialsWriteTime = writeTime;
+            }
+        }
         writeAtomically(jsonPath.parent_path() / "rt_materials.html", editorHtml("Ray traced materials", "materials", "rt_materials.json", utf8(jsonPath.parent_path()), materialsText));
 
         // Emitters: the listed ones first, then the candidates the game found, each grouped by where first seen.
@@ -2114,7 +2203,8 @@ fillAreas();render();
         std::scoped_lock lock(mutex);
         pendingProbes.erase(key);
         probedThisSession.insert(key);
-        if (stats.coverage <= 0.0f) {
+        // An opaque draw shows its texture whatever the alpha, so one that's see-through to the probe still gets an entry.
+        if ((stats.coverage <= 0.0f) && placement.alphaTested) {
             return;
         }
 

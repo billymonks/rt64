@@ -1265,6 +1265,9 @@ void EmissiveColorRayGen() {
     float alphaSum = 0.0;
     float luminanceSum = 0.0;
     float luminanceSquareSum = 0.0;
+    float3 plainColorSum = 0.0;
+    float plainLuminanceSum = 0.0;
+    float plainLuminanceSquareSum = 0.0;
     float3 peakColor = 0.0;
     float peakBrightness = 0.0;
     uint sampleCount = 0;
@@ -1280,6 +1283,9 @@ void EmissiveColorRayGen() {
         alphaSum += alpha;
         luminanceSum += luminance * alpha;
         luminanceSquareSum += luminance * luminance * alpha;
+        plainColorSum += color;
+        plainLuminanceSum += luminance;
+        plainLuminanceSquareSum += luminance * luminance;
         sampleCount++;
 
         // The brightest clearly visible texel: the core of a mostly transparent spark.
@@ -1292,9 +1298,12 @@ void EmissiveColorRayGen() {
 
     if (probe) {
         const uint probeSlot = light.groupBits & 0xFF;
-        const float3 probeColor = (alphaSum > 1e-3) ? (colorSum / alphaSum) : float3(0.0, 0.0, 0.0);
-        const float luminanceMean = (alphaSum > 1e-3) ? (luminanceSum / alphaSum) : 0.0;
-        const float luminanceVariance = (alphaSum > 1e-3) ? max(luminanceSquareSum / alphaSum - luminanceMean * luminanceMean, 0.0) : 0.0;
+        // A texture with every alpha bit clear drawn opaque (most character skins) shows all its colors: averaged unweighted.
+        const bool weighted = (alphaSum > 1e-3);
+        const float weight = weighted ? alphaSum : float(max(sampleCount, 1u));
+        const float3 probeColor = (weighted ? colorSum : plainColorSum) / weight;
+        const float luminanceMean = (weighted ? luminanceSum : plainLuminanceSum) / weight;
+        const float luminanceVariance = max((weighted ? luminanceSquareSum : plainLuminanceSquareSum) / weight - luminanceMean * luminanceMean, 0.0);
         gHitNormalFog[kMaterialProbeStart + probeSlot * 2] = float4(probeColor, alphaSum / float(max(sampleCount, 1u)));
         gHitNormalFog[kMaterialProbeStart + probeSlot * 2 + 1] = float4(sqrt(luminanceVariance), peakBrightness, float(sampleCount), 1.0);
         return;

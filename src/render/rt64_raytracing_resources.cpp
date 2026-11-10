@@ -1335,7 +1335,7 @@ namespace RT64 {
         // Manual point lights of this area (rt_lights.json), after the tracked emissive lights (whose diagnostics pair
         // frameLights with trackedEmissives by index) and before the material probes.
         frameManualLightIds.clear();
-        emitterList.pollManualLights();
+        emitterList.pollEditedFiles();
         const std::shared_ptr<const std::vector<RtManualLight>> manual = emitterList.manualLightList();
         frameManualLights.clear();
         frameAreaManualLights = 0;

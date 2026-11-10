@@ -287,9 +287,9 @@ namespace RT64 {
 
     // Material guesses and user overrides by texture key (the tmem hash, like the emissive keys), kept in
     // rt_materials.json under Documents\Quest64Recompiled\Ray Tracing, with a PNG preview of each texture in rt_materials\ and
-    // an rt_materials.html index to browse them. The file is read once, seeded from assets/materials/rt_materials.json
-    // next to the executable. Loading, saving and the previews all run on a background thread; until the file is
-    // loaded every surface is matte.
+    // an rt_materials.html index to browse them. The file is seeded from assets/materials/rt_materials.json next to the
+    // executable, and its user entries are read again when it changes. Loading, saving and the previews all run on a
+    // background thread; until the file is loaded every surface is matte.
     class RtMaterialDatabase {
     public:
         ~RtMaterialDatabase();
@@ -339,12 +339,14 @@ namespace RT64 {
         // Whether the sun or moon lights this room, and where that comes from: "default", "local" or "shipped", and
         // whether a "map-wide" or "room" entry decided it.
         bool sunAndMoonEnabled(int map, int room, const char *&source, const char *&scope);
-        // Called once per frame: about once a second asks the background thread whether rt_lights.json changed
-        // (see kManualLightsHotReload).
-        void pollManualLights();
+        // Called once per frame: about once a second asks the background thread whether rt_lights.json or
+        // rt_materials.json changed (see kManualLightsHotReload and kMaterialsHotReload).
+        void pollEditedFiles();
 
     private:
         void loadManualLights(bool onlyIfChanged);
+        // The user entries of an rt_materials.json changed outside the game replace the ones in memory.
+        void loadEditedMaterials();
         void load();
         void writeFiles(const std::unordered_map<uint64_t, RtMaterialEntry> &snapshot, const std::unordered_map<uint64_t, RtEmitterEntry> &emitterSnapshot);
         void post(std::function<void()> job);
@@ -361,6 +363,8 @@ namespace RT64 {
         bool dirty = false;
         uint32_t lastSaveFrame = 0;
         std::string localPath;
+        // When rt_materials.json was last read or written by the game, to tell an outside edit from its own saves.
+        std::filesystem::file_time_type materialsWriteTime{};
         std::string previewDirectory;
         std::unordered_map<uint64_t, RtMaterialEntry> entries;
         std::unordered_set<uint64_t> probedThisSession;
@@ -373,8 +377,8 @@ namespace RT64 {
         std::string manualLightsFile;
         std::vector<RtRoomSetting> roomSettings;
         std::filesystem::file_time_type manualLightsWriteTime{};
-        std::atomic<bool> manualLightsCheckPending = false;
-        std::chrono::steady_clock::time_point manualLightsLastPoll{};
+        std::atomic<bool> editedFilesCheckPending = false;
+        std::chrono::steady_clock::time_point editedFilesLastPoll{};
         std::unordered_set<uint64_t> emitterTextureKeys;
         std::unordered_set<uint64_t> wouldGlowTextures;
 
