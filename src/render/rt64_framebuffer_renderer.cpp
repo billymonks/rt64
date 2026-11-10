@@ -2567,6 +2567,8 @@ namespace RT64 {
                 ((rtResources->lastIndirectBounces != 0) && (rtResources->lastIndirectBounces != bounces))) ? 1u : 0u;
             rtParams.indirectBounces = bounces;
             rtResources->lastIndirectBounces = bounces;
+            // Graphics menu Light Samples, Denoiser and Light Accumulation.
+            rtResources->updateLightQuality();
             rtParams.waterDraws = raytracingAdvancedWater() ? uint32_t(rtScene.waterDraws.size()) : 0u;
             static const std::chrono::steady_clock::time_point waterClockStart = std::chrono::steady_clock::now();
             const double waterSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - waterClockStart).count();
@@ -2622,6 +2624,7 @@ namespace RT64 {
 
             rtResources->logSceneDiagnostics(rtScene);
             rtResources->logUpscalerDiagnostics();
+            rtResources->logLightQualityDiagnostics();
             if (requested) {
                 rtDiagLog("  draws that are not path traced this frame (%zu%s):", rtDiagDrawRecords.size(), (rtDiagDrawRecords.size() >= 250) ? ", list capped" : "");
                 for (const std::string &record : rtDiagDrawRecords) {
@@ -2658,7 +2661,12 @@ namespace RT64 {
                 RenderTextureBarrier(rtResources->filteredDirectLightTexture[0].get(), RenderTextureLayout::GENERAL),
                 RenderTextureBarrier(rtResources->filteredDirectLightTexture[1].get(), RenderTextureLayout::GENERAL),
                 RenderTextureBarrier(rtResources->filteredIndirectLightTexture[0].get(), RenderTextureLayout::GENERAL),
-                RenderTextureBarrier(rtResources->filteredIndirectLightTexture[1].get(), RenderTextureLayout::GENERAL)
+                RenderTextureBarrier(rtResources->filteredIndirectLightTexture[1].get(), RenderTextureLayout::GENERAL),
+                RenderTextureBarrier(rtResources->momentsTexture[0].get(), RenderTextureLayout::GENERAL),
+                RenderTextureBarrier(rtResources->momentsTexture[1].get(), RenderTextureLayout::GENERAL),
+                RenderTextureBarrier(rtResources->lightVarianceTexture[0].get(), RenderTextureLayout::GENERAL),
+                RenderTextureBarrier(rtResources->lightVarianceTexture[1].get(), RenderTextureLayout::GENERAL),
+                RenderTextureBarrier(rtResources->lightGuideTexture.get(), RenderTextureLayout::GENERAL)
             };
 
             worker->commandList->barriers(RenderBarrierStage::COMPUTE, afterCreationBarriers, uint32_t(std::size(afterCreationBarriers)));
@@ -2798,6 +2806,10 @@ namespace RT64 {
 
         rtResources->writePassTimestamp(worker, RaytracingResources::PassTimestamp::Reflection);
 
+        // Blend this frame's light samples with the reprojected history.
+        rtResources->submitLightTemporal(worker);
+        rtResources->writePassTimestamp(worker, RaytracingResources::PassTimestamp::Temporal);
+
         // After the specular pass, so the center pixel's specular is in the capture too.
         if (diagCapture) {
             rtResources->copyDiagnosticBuffers(worker);
@@ -2808,6 +2820,8 @@ namespace RT64 {
             rtResources->decalCheckThisFrame = false;
         }
 
+        // With the denoiser off, the accumulated direct light is shown as it is and the indirect light gets a light blur.
+        if (!rtResources->submitLightDenoise(worker)) {
         // Copy direct light raw buffer to the first direct filtered buffer.
         {
             RenderTexture *source = rtResources->directLightTexture[rtResources->swapBuffers ? 1 : 0].get();
@@ -2879,6 +2893,9 @@ namespace RT64 {
                 worker->commandList->barriers(RenderBarrierStage::COMPUTE, afterBlurBarriers, uint32_t(std::size(afterBlurBarriers)));
             }
         }
+        }
+
+        rtResources->writePassTimestamp(worker, RaytracingResources::PassTimestamp::Denoise);
 
         // Compose the output buffer.
         RenderTexture *rtOutputCur = rtResources->outputTexture[rtResources->swapBuffers ? 1 : 0].get();

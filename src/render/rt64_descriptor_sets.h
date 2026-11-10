@@ -410,6 +410,78 @@ namespace RT64 {
         }
     };
 
+    // Temporal accumulation of the ray traced lighting (RtTemporalCS).
+    struct RtTemporalDescriptorSet : RenderDescriptorSetBase {
+        uint32_t RtParams;
+        uint32_t gDepth;
+        uint32_t gShadingPosition;
+        uint32_t gShadingNormal;
+        uint32_t gNormalRoughness;
+        uint32_t gPrevNormalRoughness;
+        uint32_t gRawDirect;
+        uint32_t gRawIndirect;
+        uint32_t gPrevDirect;
+        uint32_t gPrevIndirect;
+        uint32_t gPrevMoments;
+        uint32_t gDirectOut;
+        uint32_t gIndirectOut;
+        uint32_t gMomentsOut;
+        uint32_t gVarianceOut;
+        uint32_t gGuideOut;
+
+        RtTemporalDescriptorSet(RenderDevice *device = nullptr) {
+            builder.begin();
+            RtParams = builder.addConstantBuffer(0);
+            gDepth = builder.addReadWriteTexture(1);
+            gShadingPosition = builder.addReadWriteTexture(2);
+            gShadingNormal = builder.addReadWriteTexture(3);
+            gNormalRoughness = builder.addReadWriteTexture(4);
+            gPrevNormalRoughness = builder.addReadWriteTexture(5);
+            gRawDirect = builder.addReadWriteTexture(6);
+            gRawIndirect = builder.addReadWriteTexture(7);
+            gPrevDirect = builder.addReadWriteTexture(8);
+            gPrevIndirect = builder.addReadWriteTexture(9);
+            gPrevMoments = builder.addReadWriteTexture(10);
+            gDirectOut = builder.addReadWriteTexture(11);
+            gIndirectOut = builder.addReadWriteTexture(12);
+            gMomentsOut = builder.addReadWriteTexture(13);
+            gVarianceOut = builder.addReadWriteTexture(14);
+            gGuideOut = builder.addReadWriteTexture(15);
+            builder.end();
+
+            if (device != nullptr) {
+                create(device);
+            }
+        }
+    };
+
+    // One pass of the edge-aware filter of the ray traced lighting (RtDenoiseCS).
+    struct RtDenoiseDescriptorSet : RenderDescriptorSetBase {
+        uint32_t gGuide;
+        uint32_t gDirectIn;
+        uint32_t gIndirectIn;
+        uint32_t gVarianceIn;
+        uint32_t gDirectOut;
+        uint32_t gIndirectOut;
+        uint32_t gVarianceOut;
+
+        RtDenoiseDescriptorSet(RenderDevice *device = nullptr) {
+            builder.begin();
+            gGuide = builder.addReadWriteTexture(1);
+            gDirectIn = builder.addReadWriteTexture(2);
+            gIndirectIn = builder.addReadWriteTexture(3);
+            gVarianceIn = builder.addReadWriteTexture(4);
+            gDirectOut = builder.addReadWriteTexture(5);
+            gIndirectOut = builder.addReadWriteTexture(6);
+            gVarianceOut = builder.addReadWriteTexture(7);
+            builder.end();
+
+            if (device != nullptr) {
+                create(device);
+            }
+        }
+    };
+
     struct HistogramAverageDescriptorSet : RenderDescriptorSetBase {
         uint32_t LuminanceHistogram;
         uint32_t LuminanceOutput;

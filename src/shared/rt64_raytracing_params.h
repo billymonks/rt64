@@ -112,6 +112,13 @@ namespace interop {
         // Where the draws' foliage centers start in gRtMaterials (three words per draw: X, Z, radius), or 0 when no draw
         // of the frame is foliage.
         uint foliageOffset;
+        // Graphics menu "Light Samples": sun shadow, light, bounce and occlusion rays per pixel and frame (1, 2 or 4).
+        uint lightSamples;
+        // Graphics menu "Light Accumulation" (RtTemporalCS): the smallest blend weight of a new frame, the longest history
+        // in frames, and how far history may stray from the current frame's neighborhood, in standard deviations.
+        float temporalMinBlend;
+        float temporalMaxHistory;
+        float temporalClipGamma;
 
 #   ifdef HLSL_CPU
         RaytracingParams() {
@@ -172,6 +179,10 @@ namespace interop {
             decalCheck = 0;
             emissionOffset = 0;
             foliageOffset = 0;
+            lightSamples = 1;
+            temporalMinBlend = 0.1f;
+            temporalMaxHistory = 16.0f;
+            temporalClipGamma = 1.5f;
         }
 #   endif
     };

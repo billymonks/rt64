@@ -396,6 +396,7 @@ set (SOURCES
     "${PROJECT_SOURCE_DIR}/src/render/rt64_upscaler_fsr1.cpp"
     "${PROJECT_SOURCE_DIR}/src/render/rt64_upscaler_fsr3.cpp"
     "${PROJECT_SOURCE_DIR}/src/render/rt64_raytracing_upscale.cpp"
+    "${PROJECT_SOURCE_DIR}/src/render/rt64_raytracing_denoise.cpp"
     "${PROJECT_SOURCE_DIR}/src/render/rt64_vertex_processor.cpp"
     "${PROJECT_SOURCE_DIR}/src/render/rt64_vi_renderer.cpp"
 
@@ -573,6 +574,8 @@ build_pixel_shader(  rt64 "src/shaders/PostProcessPS.hlsl")
 build_compute_shader(rt64 "src/shaders/FsrEasuCS.hlsl" "src/shaders/FsrEasuCS.hlsl" "-I${RT64_FFX_KIT}/api/internal/gpu" "-I${RT64_FFX_KIT}/upscalers/fsr3/include/gpu/fsr1")
 build_compute_shader(rt64 "src/shaders/FsrRcasCS.hlsl" "src/shaders/FsrRcasCS.hlsl" "-I${RT64_FFX_KIT}/api/internal/gpu" "-I${RT64_FFX_KIT}/upscalers/fsr3/include/gpu/fsr1")
 build_compute_shader(rt64 "src/shaders/UpscalerInputsCS.hlsl")
+build_compute_shader(rt64 "src/shaders/RtTemporalCS.hlsl")
+build_compute_shader(rt64 "src/shaders/RtDenoiseCS.hlsl")
 if (WIN32 AND RT64_FSR3 AND EXISTS "${RT64_FFX_KIT}/upscalers/include/ffx_upscale.h")
     target_compile_definitions(rt64 PRIVATE RT64_FSR3_ENABLED=1)
     target_include_directories(rt64 PRIVATE "${RT64_FFX_KIT}/api/include" "${RT64_FFX_KIT}/upscalers/include")

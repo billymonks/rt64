@@ -354,6 +354,8 @@ namespace RT64 {
             Indirect,
             Refraction,
             Reflection,
+            Temporal,
+            Denoise,
             Compose,
             Upscale,
             Post,
@@ -370,6 +372,26 @@ namespace RT64 {
         uint32_t activePassQuerySlot = 0;
         float passMs[PassCount] = {};
         float totalPassMs = 0.0f;
+
+        // Temporal accumulation and spatial filter of the ray traced lighting (rt64_raytracing_denoise.cpp). The light
+        // passes write this frame's samples to filteredDirectLightTexture[1] and filteredIndirectLightTexture[1];
+        // RtTemporalCS blends them into directLightTexture and indirectLightTexture, and RtDenoiseCS filters those into
+        // filteredDirectLightTexture[1] and filteredIndirectLightTexture[1] for ComposePS.
+        static const uint32_t MaxDenoisePasses = 5;
+        uint32_t lightSamplesLevel = 0;
+        uint32_t denoiserLevel = 0;
+        uint32_t accumulationLevel = 0;
+        uint32_t denoisePassCount = 0;
+        std::unique_ptr<RenderTexture> momentsTexture[2];
+        std::unique_ptr<RenderTexture> lightVarianceTexture[2];
+        std::unique_ptr<RenderTexture> lightGuideTexture;
+        std::unique_ptr<struct RtTemporalDescriptorSet> lightTemporalSet;
+        std::unique_ptr<struct RtDenoiseDescriptorSet> lightDenoiseSets[MaxDenoisePasses];
+        std::unique_ptr<RenderPipelineLayout> lightTemporalPipelineLayout;
+        std::unique_ptr<RenderPipeline> lightTemporalPipeline;
+        std::unique_ptr<RenderPipelineLayout> lightDenoisePipelineLayout;
+        std::unique_ptr<RenderPipeline> lightDenoisePipeline;
+        bool lightFilterPipelinesCreated = false;
 
         std::unique_ptr<RenderTexture> viewDirectionTexture;
         std::unique_ptr<RenderTexture> shadingPositionTexture;
@@ -687,6 +709,11 @@ namespace RT64 {
         void writePassTimestamp(RenderWorker *worker, PassTimestamp timestamp);
         void endPassTiming();
         void logUpscalerDiagnostics();
+        void updateLightQuality();
+        void createLightFilterPipelines();
+        void submitLightTemporal(RenderWorker *worker);
+        bool submitLightDenoise(RenderWorker *worker);
+        void logLightQualityDiagnostics();
         void updateInterleavedRenderTargets(RenderWorker *worker, uint32_t width, uint32_t height, uint32_t count, const RenderMultisampling &multisampling, bool usesHDR);
         void updateShaderSets(RenderWorker *worker, const ShaderLibrary *shaderLibrary);
         void updateMultisampling();
@@ -719,4 +746,7 @@ namespace RT64 {
     // Graphics menu "Upscaler", "Quality" and "Sharpness": mode is a RaytracingUpscaler, quality is 0 (Native AA),
     // 1 (Quality), 2 (Balanced), 3 (Performance) or 4 (Ultra Performance), sharpness is from 0 to 1.
     void setRaytracingUpscaler(uint32_t mode, uint32_t quality, float sharpness);
+    // Graphics menu "Light Samples" (0: 1 ray, 1: 2 rays, 2: 4 rays), "Denoiser" (0: Off, 1: Low, 2: High) and "Light
+    // Accumulation" (0: Responsive, 1: Balanced, 2: Stable).
+    void setRaytracingLightQuality(uint32_t samples, uint32_t denoiser, uint32_t accumulation);
 };

@@ -183,11 +183,15 @@ namespace RT64 {
             depthTexture[i] = makeTexture(device, textureWidth, textureHeight, RenderFormat::R32_FLOAT, uav);
             filteredDirectLightTexture[i] = makeTexture(device, textureWidth, textureHeight, RenderFormat::R16G16B16A16_FLOAT, uav);
             filteredIndirectLightTexture[i] = makeTexture(device, textureWidth, textureHeight, RenderFormat::R16G16B16A16_FLOAT, uav);
+            momentsTexture[i] = makeTexture(device, textureWidth, textureHeight, RenderFormat::R16G16B16A16_FLOAT, uav);
+            lightVarianceTexture[i] = makeTexture(device, textureWidth, textureHeight, RenderFormat::R16G16B16A16_FLOAT, uav);
             outputTexture[i] = worker->device->createTexture(RenderTextureDesc::ColorTarget(textureWidth, textureHeight, RenderFormat::R32G32B32A32_FLOAT));
             const RenderTexture *color = outputTexture[i].get();
             outputFramebuffer[i] = worker->device->createFramebuffer(RenderFramebufferDesc(&color, 1));
         }
 
+        // Full precision: the view depth in alpha can exceed half float range in large areas.
+        lightGuideTexture = makeTexture(device, textureWidth, textureHeight, RenderFormat::R32G32B32A32_FLOAT, uav);
         lumaAverageTexture = makeTexture(device, 1, 1, RenderFormat::R32_FLOAT, uav);
         downscaledOutputTexture = makeTexture(device, std::max(textureWidth / 8, 1u), std::max(textureHeight / 8, 1u), RenderFormat::R32G32B32A32_FLOAT, uav);
         upscaledOutputTexture = makeTexture(device, this->displayWidth, this->displayHeight, RenderFormat::R16G16B16A16_FLOAT, uav);

@@ -56,11 +56,9 @@ static const float3 kReflectionSkyColor = float3(0.85, 0.92, 1.05);
 static const float kMetalDiffuseLoss = 0.5;
 // Fraction of an emissive light's sprite size used as the radius of the light for soft shadows.
 static const float kEmissiveLightRadiusScale = 0.5;
-// Temporal accumulation: the weight of the new frame never drops below this (lower is smoother but lags more),
-// and the history length is capped.
-static const float kTemporalMinBlend = 0.1;
-static const float kTemporalMaxHistory = 16.0;
-// History is reused when the reprojected depth matches within this fraction and the normals agree.
+// The light passes write this frame's samples; RtTemporalCS blends them with history and RtDenoiseCS filters them.
+// History is reused when the reprojected depth matches within this fraction and the normals agree (RtTemporalCS
+// tests the same).
 static const float kTemporalDepthTolerance = 0.05;
 static const float kTemporalNormalTolerance = 0.8;
 // Ray traced ambient occlusion: the length of the occlusion rays in world units. Its strength is in ComposePS.
@@ -948,11 +946,28 @@ float3 sampleCone(float3 axis, float angularRadius, float2 noise) {
     return normalize(axis + (tangent * cos(phi) + bitangent * sin(phi)) * radius);
 }
 
+// Blue noise tile of one of the pixel's samples this frame. With n samples per pixel, frame f takes tiles f * n to
+// f * n + n - 1, so no two samples of a pixel share a tile until the 64 tiles wrap around; each wrap also shifts the
+// tile so the sequence doesn't repeat exactly. One sample per pixel is the plain frame count.
+uint noiseFrame(uint sampleIndex) {
+    return FrParams.frameCount * max(RtParams.lightSamples, 1u) + sampleIndex;
+}
+
+uint2 noiseShift(uint sampleIndex) {
+    const uint cycle = (RtParams.lightSamples > 1) ? (noiseFrame(sampleIndex) / 64u) : 0u;
+    return uint2(cycle * 13u, cycle * 29u);
+}
+
 // Per pixel noise that changes every frame, for the soft shadow and occlusion samples that temporal accumulation
 // averages. The channel picks a decorrelated sample set.
-float2 pixelNoise(uint2 pix, uint channel) {
-    const float3 noise = getBlueNoise(gBlueNoise, pix + uint2(channel * 23u, channel * 41u), FrParams.frameCount + channel * 17u);
+float2 pixelNoise(uint2 pix, uint channel, uint sampleIndex) {
+    const float3 noise = getBlueNoise(gBlueNoise, pix + noiseShift(sampleIndex) + uint2(channel * 23u, channel * 41u), noiseFrame(sampleIndex) + channel * 17u);
     return noise.xy;
+}
+
+// Cosine weighted direction for one of the pixel's samples; offset picks a decorrelated set as the channel does.
+float3 pixelCosineDirection(uint2 pix, uint2 offset, uint frameOffset, uint sampleIndex, float3 normal) {
+    return getCosHemisphereSampleBlueNoise(gBlueNoise, pix + noiseShift(sampleIndex) + offset, noiseFrame(sampleIndex) + frameOffset, normal);
 }
 
 LightSample sampleLight(float3 position, float3 normal, float3 geometricNormal, float hitT, float selfRenderIndex, bool twoSided, float2 noise) {
@@ -1446,9 +1461,6 @@ void PrimaryRayGen() {
     gTransparent[pix] = 0.0;
     gReflection[pix] = 0.0;
     gRefraction[pix] = 0.0;
-    gDirectLightAccum[pix] = 0.0;
-    gIndirectLightAccum[pix] = 0.0;
-
     const bool insideViewport = pixelInViewport(pix);
     diagCount(kDiagOutsideViewport, !insideViewport);
     float3 origin, direction;
@@ -1695,11 +1707,8 @@ float colorLuminance(float3 color) {
     return dot(color, float3(0.3, 0.59, 0.11));
 }
 
-// Blend weight of the new sample, from the history length (a running average that settles at kTemporalMinBlend).
-float temporalBlend(float historyLength) {
-    return max(1.0 / historyLength, kTemporalMinBlend);
-}
-
+// This frame's direct light, the average of RtParams.lightSamples independent samples, goes to gFilteredDirectLight
+// (alpha 1 on surfaces, 0 where the camera ray missed). RtTemporalCS blends it with history into gDirectLightAccum.
 [shader("raygeneration")]
 void DirectRayGen() {
     uint2 pix = rayPixel();
@@ -1711,31 +1720,33 @@ void DirectRayGen() {
     float hitT;
     bool twoSided;
     if (!primaryHit(pix, position, normal, geometricNormal, velocity, hitT, twoSided)) {
-        // No history either (alpha is the history length).
-        gDirectLightAccum[pix] = float4(1.0, 1.0, 1.0, 0.0);
+        gFilteredDirectLight[pix] = float4(1.0, 1.0, 1.0, 0.0);
         if (isDiagPixel(pix)) {
             gHitColor[13] = float4(0.0, 0.0, 0.0, 1.0);
         }
         return;
     }
 
-    LightSample light = sampleLight(position, normal, geometricNormal, hitT, float(gInstanceId[pix]), twoSided, pixelNoise(pix, 0));
-    const float3 emissive = kHybridLighting ? float3(0.0, 0.0, 0.0) : sampleEmissive(position, normal, geometricNormal, hitT, true, pixelNoise(pix, 1));
-    const float3 current = light.factor + emissive;
+    // The first sample's terms feed the debug views and the diagnostics.
+    const float selfRenderIndex = float(gInstanceId[pix]);
+    const uint sampleCount = clamp(RtParams.lightSamples, 1u, 4u);
+    LightSample light = (LightSample)0;
+    float3 emissive = 0.0;
+    float3 current = 0.0;
+    [loop]
+    for (uint s = 0; s < sampleCount; s++) {
+        const LightSample sampled = sampleLight(position, normal, geometricNormal, hitT, selfRenderIndex, twoSided, pixelNoise(pix, 0, s));
+        const float3 sampledEmissive = kHybridLighting ? float3(0.0, 0.0, 0.0) : sampleEmissive(position, normal, geometricNormal, hitT, true, pixelNoise(pix, 1, s));
+        if (s == 0) {
+            light = sampled;
+            emissive = sampledEmissive;
+        }
 
-    // Temporal accumulation averages the soft shadow samples. A sudden brightening (a spell burst, a hit spark) is
-    // taken up quickly so it doesn't lag behind.
-    int2 previousPixel;
-    const bool historyValid = reprojectHistory(position, velocity, geometricNormal, previousPixel);
-    const float4 history = historyValid ? gPrevDirectLightAccum[previousPixel] : float4(0.0, 0.0, 0.0, 0.0);
-    const float historyLength = historyValid ? min(history.a + 1.0, kTemporalMaxHistory) : 1.0;
-    float blend = temporalBlend(historyLength);
-    if (colorLuminance(current) > (colorLuminance(history.rgb) * 1.5 + 0.05)) {
-        blend = max(blend, 0.5);
+        current += sampled.factor + sampledEmissive;
     }
 
-    const float3 accumulated = historyValid ? lerp(history.rgb, current, blend) : current;
-    gDirectLightAccum[pix] = float4(accumulated, historyLength);
+    current /= float(sampleCount);
+    gFilteredDirectLight[pix] = float4(current, 1.0);
 
     // F10 debug views: the color replaces the image (white material, no ambient, fill, specular or fog).
     if (RtParams.debugView != 0) {
@@ -1767,12 +1778,14 @@ void DirectRayGen() {
         }
         }
 
-        gDirectLightAccum[pix] = float4(debugColor, 1.0);
+        gFilteredDirectLight[pix] = float4(debugColor, 1.0);
         gDiffuse[pix] = float4(1.0, 1.0, 1.0, 1.0);
         gFlow[pix] = float2(0.0, 0.0);
         gTransparent[pix] = float4(0.0, 0.0, 0.0, 0.0);
     }
     if (diagFrame()) {
+        int2 previousPixel;
+        const bool historyValid = reprojectHistory(position, velocity, geometricNormal, previousPixel);
         diagCount(kDiagShadowRays, RtParams.emissiveLightStart > 0);
         diagCount(kDiagShadowBlocked, (RtParams.emissiveLightStart > 0) && (light.visibility < 0.5));
         diagCount(kDiagHistoryTested, true);
@@ -1791,7 +1804,9 @@ void DirectRayGen() {
     }
 }
 
-// One diffuse bounce with the bounce surface's real material and its own shadowed direct light.
+// One diffuse bounce with the bounce surface's real material and its own shadowed direct light, and a short ambient
+// occlusion ray. This frame's fill and occlusion, averaged over RtParams.lightSamples samples, go to
+// gFilteredIndirectLight; RtTemporalCS blends them with history into gIndirectLightAccum.
 [shader("raygeneration")]
 void IndirectRayGen() {
     uint2 pix = rayPixel();
@@ -1804,75 +1819,89 @@ void IndirectRayGen() {
     bool twoSided;
     if (kHybridLighting || !primaryHit(pix, position, normal, geometricNormal, velocity, hitT, twoSided)) {
         // No fill and no occlusion.
-        gIndirectLightAccum[pix] = float4(0.0, 0.0, 0.0, 1.0);
+        gFilteredIndirectLight[pix] = float4(0.0, 0.0, 0.0, 1.0);
         return;
     }
 
-    // One bounce ray per pixel and frame; temporal accumulation and the spatial filter average them.
     const float bias = surfaceBias(hitT);
     const float3 origin = position + geometricNormal * bias;
-    float3 bounceDir = getCosHemisphereSampleBlueNoise(gBlueNoise, pix, FrParams.frameCount, normal);
-    if (dot(bounceDir, geometricNormal) <= 0.0) {
-        bounceDir = reflect(bounceDir, geometricNormal);
-    }
-
-    // Bounce rays are blurry, so they sample coarse texture levels.
-    HitPayload bounce = traceSurface(origin, bounceDir, 0.0, 1.0e6, hitT * RtParams.pixelSpreadAngle, kBounceConeSpread, false, kCameraRayMask);
     // Open sky, unless the room's sun and moon are off: N64 interiors are often open above or behind the camera, and
     // the sky would light a room meant to be lit only by its own lights.
     const float skyLight = (RtParams.sunDisabled != 0) ? 0.0 : kSkyBounce;
-    float3 bounceLight;
+    const uint sampleCount = clamp(RtParams.lightSamples, 1u, 4u);
+    float3 bounceLight = 0.0;
     float3 secondLight = 0.0;
-    if (bounce.hit > 0.5) {
-        const float3 bouncePos = origin + bounceDir * bounce.hitT;
-        const float3 bounceNormal = float3(bounce.nx, bounce.ny, bounce.nz);
-        const float3 bounceGeometricNormal = float3(bounce.gx, bounce.gy, bounce.gz);
-        const bool bounceTwoSided = hitTwoSided(bounce.hit);
-        LightSample bounceSample = sampleLight(bouncePos, bounceNormal, bounceGeometricNormal, hitT + bounce.hitT, bounce.renderIndex, bounceTwoSided, pixelNoise(pix, 2));
-        // Emissive lights at the bounce point, without shadow rays to keep the bounce cheap.
-        const float3 bounceEmissive = sampleEmissive(bouncePos, bounceNormal, bounceGeometricNormal, hitT + bounce.hitT, false, pixelNoise(pix, 3));
-        const float3 albedo1 = float3(bounce.ar, bounce.ag, bounce.ab);
-        // An emissive surface (lava) the bounce ray hits gives off its own light too.
-        bounceLight = albedo1 * (bounceSample.factor + bounceEmissive) + surfaceEmission(uint(bounce.renderIndex), albedo1);
+    float occlusion = 0.0;
+    [loop]
+    for (uint s = 0; s < sampleCount; s++) {
+        float3 bounceDir = pixelCosineDirection(pix, uint2(0u, 0u), 0u, s, normal);
+        if (dot(bounceDir, geometricNormal) <= 0.0) {
+            bounceDir = reflect(bounceDir, geometricNormal);
+        }
 
-        // Second bounce (Graphics menu "Second light bounce"): one more cosine weighted ray from the bounce point. With
-        // cosine sampling the estimate is just the light coming back along the ray, times this surface's albedo. Only
-        // the sun's share above the shadow floor counts there, since the floor stands for ambient light the first
-        // bounce already has.
-        if ((RtParams.indirectBounces >= 2) && (max(albedo1.r, max(albedo1.g, albedo1.b)) > kSecondBounceMinAlbedo)) {
-            const float3 secondNormal = bounceTwoSided ? ((dot(bounceNormal, bounceDir) > 0.0) ? -bounceNormal : bounceNormal) : bounceNormal;
-            const float3 secondGeometric = (dot(secondNormal, bounceGeometricNormal) >= 0.0) ? bounceGeometricNormal : -bounceGeometricNormal;
-            const float secondBias = surfaceBias(hitT + bounce.hitT);
-            const float3 secondOrigin = bouncePos + secondGeometric * secondBias;
-            float3 secondDir = getCosHemisphereSampleBlueNoise(gBlueNoise, pix + uint2(53u, 97u), FrParams.frameCount + 29u, secondNormal);
-            if (dot(secondDir, secondGeometric) <= 0.0) {
-                secondDir = reflect(secondDir, secondGeometric);
-            }
+        // Bounce rays are blurry, so they sample coarse texture levels.
+        HitPayload bounce = traceSurface(origin, bounceDir, 0.0, 1.0e6, hitT * RtParams.pixelSpreadAngle, kBounceConeSpread, false, kCameraRayMask);
+        if (bounce.hit > 0.5) {
+            const float3 bouncePos = origin + bounceDir * bounce.hitT;
+            const float3 bounceNormal = float3(bounce.nx, bounce.ny, bounce.nz);
+            const float3 bounceGeometricNormal = float3(bounce.gx, bounce.gy, bounce.gz);
+            const bool bounceTwoSided = hitTwoSided(bounce.hit);
+            LightSample bounceSample = sampleLight(bouncePos, bounceNormal, bounceGeometricNormal, hitT + bounce.hitT, bounce.renderIndex, bounceTwoSided, pixelNoise(pix, 2, s));
+            // Emissive lights at the bounce point, without shadow rays to keep the bounce cheap.
+            const float3 bounceEmissive = sampleEmissive(bouncePos, bounceNormal, bounceGeometricNormal, hitT + bounce.hitT, false, pixelNoise(pix, 3, s));
+            const float3 albedo1 = float3(bounce.ar, bounce.ag, bounce.ab);
+            // An emissive surface (lava) the bounce ray hits gives off its own light too.
+            bounceLight += albedo1 * (bounceSample.factor + bounceEmissive) + surfaceEmission(uint(bounce.renderIndex), albedo1);
 
-            const float secondCone = (hitT + bounce.hitT) * RtParams.pixelSpreadAngle + bounce.hitT * kBounceConeSpread;
-            HitPayload second = traceSurface(secondOrigin, secondDir, 0.0, 1.0e6, secondCone, kBounceConeSpread * 2.0, false, kCameraRayMask);
-            float3 secondIncoming;
-            if (second.hit > 0.5) {
-                const float3 secondPos = secondOrigin + secondDir * second.hitT;
-                const float3 secondHitNormal = float3(second.nx, second.ny, second.nz);
-                const float3 secondHitGeometric = float3(second.gx, second.gy, second.gz);
-                const float secondHitT = hitT + bounce.hitT + second.hitT;
-                LightSample secondSample = sampleLight(secondPos, secondHitNormal, secondHitGeometric, secondHitT, second.renderIndex, hitTwoSided(second.hit), pixelNoise(pix, 4));
-                const float3 secondEmissive = sampleEmissive(secondPos, secondHitNormal, secondHitGeometric, secondHitT, false, pixelNoise(pix, 5));
-                const float3 shadowFloor = RtParams.cameraW.w * RtParams.cameraW.xyz;
-                const float3 albedo2 = float3(second.ar, second.ag, second.ab);
-                secondIncoming = albedo2 * (max(secondSample.factor - shadowFloor, 0.0) + secondEmissive) + surfaceEmission(uint(second.renderIndex), albedo2);
-            }
-            else {
-                secondIncoming = skyLight;
-            }
+            // Second bounce (Graphics menu "Second light bounce"): one more cosine weighted ray from the bounce point.
+            // With cosine sampling the estimate is just the light coming back along the ray, times this surface's
+            // albedo. Only the sun's share above the shadow floor counts there, since the floor stands for ambient light
+            // the first bounce already has.
+            if ((RtParams.indirectBounces >= 2) && (max(albedo1.r, max(albedo1.g, albedo1.b)) > kSecondBounceMinAlbedo)) {
+                const float3 secondNormal = bounceTwoSided ? ((dot(bounceNormal, bounceDir) > 0.0) ? -bounceNormal : bounceNormal) : bounceNormal;
+                const float3 secondGeometric = (dot(secondNormal, bounceGeometricNormal) >= 0.0) ? bounceGeometricNormal : -bounceGeometricNormal;
+                const float secondBias = surfaceBias(hitT + bounce.hitT);
+                const float3 secondOrigin = bouncePos + secondGeometric * secondBias;
+                float3 secondDir = pixelCosineDirection(pix, uint2(53u, 97u), 29u, s, secondNormal);
+                if (dot(secondDir, secondGeometric) <= 0.0) {
+                    secondDir = reflect(secondDir, secondGeometric);
+                }
 
-            secondLight = albedo1 * secondIncoming;
+                const float secondCone = (hitT + bounce.hitT) * RtParams.pixelSpreadAngle + bounce.hitT * kBounceConeSpread;
+                HitPayload second = traceSurface(secondOrigin, secondDir, 0.0, 1.0e6, secondCone, kBounceConeSpread * 2.0, false, kCameraRayMask);
+                float3 secondIncoming;
+                if (second.hit > 0.5) {
+                    const float3 secondPos = secondOrigin + secondDir * second.hitT;
+                    const float3 secondHitNormal = float3(second.nx, second.ny, second.nz);
+                    const float3 secondHitGeometric = float3(second.gx, second.gy, second.gz);
+                    const float secondHitT = hitT + bounce.hitT + second.hitT;
+                    LightSample secondSample = sampleLight(secondPos, secondHitNormal, secondHitGeometric, secondHitT, second.renderIndex, hitTwoSided(second.hit), pixelNoise(pix, 4, s));
+                    const float3 secondEmissive = sampleEmissive(secondPos, secondHitNormal, secondHitGeometric, secondHitT, false, pixelNoise(pix, 5, s));
+                    const float3 shadowFloor = RtParams.cameraW.w * RtParams.cameraW.xyz;
+                    const float3 albedo2 = float3(second.ar, second.ag, second.ab);
+                    secondIncoming = albedo2 * (max(secondSample.factor - shadowFloor, 0.0) + secondEmissive) + surfaceEmission(uint(second.renderIndex), albedo2);
+                }
+                else {
+                    secondIncoming = skyLight;
+                }
+
+                secondLight += albedo1 * secondIncoming;
+            }
+        }
+        else {
+            bounceLight += skyLight;
+        }
+
+        // Ray traced ambient occlusion: one short cosine weighted ray per sample.
+        const float3 occlusionDir = pixelCosineDirection(pix, uint2(31u, 17u), 11u, s, normal);
+        if (dot(occlusionDir, geometricNormal) > 0.0) {
+            occlusion += traceShadow(origin, occlusionDir, kAORadius, -1.0);
         }
     }
-    else {
-        bounceLight = skyLight;
-    }
+
+    bounceLight /= float(sampleCount);
+    secondLight /= float(sampleCount);
+    occlusion /= float(sampleCount);
 
     // Fill for the part of the surface the direct light does not reach. ComposePS combines it as
     // direct + (1 - direct) * fill, so fully lit surfaces keep the game's brightness. Rooms lit only by their own lights
@@ -1893,27 +1922,14 @@ void IndirectRayGen() {
         gHitInstanceId[kDiagBounceFill + 7] = RtParams.indirectBounces;
     }
 
-    // Ray traced ambient occlusion: one short cosine weighted ray per pixel and frame.
-    const float3 occlusionDir = getCosHemisphereSampleBlueNoise(gBlueNoise, pix + uint2(31u, 17u), FrParams.frameCount + 11u, normal);
-    float occlusion = 0.0;
-    if (dot(occlusionDir, geometricNormal) > 0.0) {
-        occlusion = traceShadow(origin, occlusionDir, kAORadius, -1.0);
-    }
-
     const float4 current = float4(fill, 1.0 - occlusion);
-
-    // Temporal accumulation, with the history length kept by the direct light pass.
-    int2 previousPixel;
-    const bool historyValid = reprojectHistory(position, velocity, geometricNormal, previousPixel);
-    const float historyLength = historyValid ? min(gPrevDirectLightAccum[previousPixel].a + 1.0, kTemporalMaxHistory) : 1.0;
-    const float4 accumulated = historyValid ? lerp(gPrevIndirectLightAccum[previousPixel], current, temporalBlend(historyLength)) : current;
-    gIndirectLightAccum[pix] = (RtParams.debugView != 0) ? float4(0.0, 0.0, 0.0, 1.0) : accumulated;
+    gFilteredIndirectLight[pix] = (RtParams.debugView != 0) ? float4(0.0, 0.0, 0.0, 1.0) : current;
     if (isDiagPixel(pix)) {
-        // Bounce fill and ambient occlusion at the center pixel.
-        gHitVelocityDistance[15] = accumulated;
+        // This frame's bounce fill and ambient occlusion at the center pixel.
+        gHitVelocityDistance[15] = current;
     }
     if (diagFrame()) {
-        const uint occlusionUnits = uint(saturate(accumulated.a) * 255.0 + 0.5);
+        const uint occlusionUnits = uint(saturate(current.a) * 255.0 + 0.5);
         const uint occlusionSum = WaveActiveSum(occlusionUnits);
         if (WaveIsFirstLane()) {
             InterlockedAdd(gHitInstanceId[kDiagOcclusionSum], occlusionSum);

@@ -67,7 +67,7 @@ namespace RT64 {
     }
 
     static const char *passNames[RaytracingResources::PassCount] = {
-        "primary", "emissive", "direct", "indirect", "refraction/water", "reflection", "compose", "upscale", "post"
+        "primary", "emissive", "direct", "indirect", "refraction/water", "reflection", "temporal", "denoise", "compose", "upscale", "post"
     };
 
     void RaytracingResources::resolveUpscaler(RenderWorker *worker, uint32_t displayWidth, uint32_t displayHeight, uint32_t &renderWidth, uint32_t &renderHeight) {
