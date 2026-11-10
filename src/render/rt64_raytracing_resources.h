@@ -373,6 +373,14 @@ namespace RT64 {
         float passMs[PassCount] = {};
         float totalPassMs = 0.0f;
 
+        // GPU time of the bottom and top level acceleration structure builds, through their own ring of query pools.
+        std::unique_ptr<RenderQueryPool> buildQueryPools[PassTimingDepth];
+        bool buildQueryWritten[PassTimingDepth] = {};
+        uint32_t buildQueryFrame = 0;
+        RenderQueryPool *activeBuildQueryPool = nullptr;
+        uint32_t activeBuildQuerySlot = 0;
+        float accelerationBuildMs = 0.0f;
+
         // Temporal accumulation and spatial filter of the ray traced lighting (rt64_raytracing_denoise.cpp). The light
         // passes write this frame's samples to filteredDirectLightTexture[1] and filteredIndirectLightTexture[1];
         // RtTemporalCS blends them into directLightTexture and indirectLightTexture, and RtDenoiseCS filters those into
@@ -448,13 +456,22 @@ namespace RT64 {
         uint64_t shaderBindingTableCapacity = 0;
         RenderShaderBindingTableInfo shaderBindingTableInfo;
 
+        // Every bottom level structure of the frame lives in bottomLevelPool at its offset, and builds in its own range
+        // of the scratch buffer so the builds can overlap. A build that starts a new scratch batch reuses the scratch
+        // from offset 0 and must wait for the batch before it.
         struct BottomLevel {
             RenderBottomLevelASMesh mesh;
             RenderBottomLevelASBuildInfo buildInfo;
-            std::unique_ptr<RenderBuffer> buffer;
+            uint64_t offset = 0;
+            uint64_t scratchOffset = 0;
+            bool newScratchBatch = false;
             std::unique_ptr<RenderAccelerationStructure> accelerationStructure;
         };
         std::vector<BottomLevel> bottomLevelASVector;
+        std::unique_ptr<RenderBuffer> bottomLevelPool;
+        uint64_t bottomLevelPoolCapacity = 0;
+        uint64_t bottomLevelPoolUsed = 0;
+        uint32_t bottomLevelScratchBatches = 0;
         std::vector<RenderBottomLevelASMesh> pendingMeshes;
         // Index into bottomLevelASVector for each pending mesh, or -1 if it was not built.
         std::vector<int32_t> pendingMeshLevels;
@@ -708,6 +725,8 @@ namespace RT64 {
         void beginPassTiming(RenderWorker *worker);
         void writePassTimestamp(RenderWorker *worker, PassTimestamp timestamp);
         void endPassTiming();
+        void beginBuildTiming(RenderWorker *worker);
+        void endBuildTiming(RenderWorker *worker);
         void logUpscalerDiagnostics();
         void updateLightQuality();
         void createLightFilterPipelines();

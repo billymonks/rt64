@@ -30,6 +30,9 @@ namespace RT64 {
     static const uint64_t kHitBufferBytes = 256;
     // The counters in gHitInstanceId (RtLibrary.hlsl kDiag*): 256 of them, the decal statistics from 64 on.
     static const uint64_t kDiagCounterBytes = 1024;
+    // Offsets of acceleration structures and their scratch memory: D3D12 and Vulkan both accept 256 bytes.
+    static const uint64_t kAccelerationStructureAlignment = 256;
+    static const uint64_t kScratchBatchBudget = 32ULL << 20;
 
     static uint64_t roundUp(uint64_t value, uint64_t alignment) {
         return (value + alignment - 1) & ~(alignment - 1);
@@ -324,6 +327,9 @@ namespace RT64 {
         }
 
         uint64_t scratchNeeded = 0;
+        uint64_t scratchBatchUsed = 0;
+        uint64_t poolNeeded = 0;
+        bottomLevelScratchBatches = 0;
         for (size_t pendingIndex = 0; pendingIndex < pendingMeshes.size(); pendingIndex++) {
             RenderBottomLevelASMesh mesh = pendingMeshes[pendingIndex];
             if ((mesh.indexCount == 0) || (mesh.vertexCount == 0) || (mesh.indexBuffer.ref == nullptr) || (mesh.vertexBuffer.ref == nullptr)) {
@@ -337,9 +343,19 @@ namespace RT64 {
                 continue;
             }
 
-            level.buffer = worker->device->createBuffer(RenderBufferDesc::AccelerationStructureBuffer(level.buildInfo.accelerationStructureSize));
-            level.accelerationStructure = worker->device->createAccelerationStructure(RenderAccelerationStructureDesc(RenderAccelerationStructureType::BOTTOM_LEVEL, level.buffer->at(0), level.buildInfo.accelerationStructureSize));
-            scratchNeeded = std::max(scratchNeeded, level.buildInfo.scratchSize);
+            level.offset = poolNeeded;
+            poolNeeded += roundUp(level.buildInfo.accelerationStructureSize, kAccelerationStructureAlignment);
+
+            const uint64_t scratchSize = roundUp(level.buildInfo.scratchSize, kAccelerationStructureAlignment);
+            if ((bottomLevelScratchBatches == 0) || ((scratchBatchUsed > 0) && (scratchBatchUsed + scratchSize > kScratchBatchBudget))) {
+                level.newScratchBatch = true;
+                bottomLevelScratchBatches++;
+                scratchBatchUsed = 0;
+            }
+
+            level.scratchOffset = scratchBatchUsed;
+            scratchBatchUsed += scratchSize;
+            scratchNeeded = std::max(scratchNeeded, scratchBatchUsed);
 
             if (mesh.indexBuffer.ref != nullptr) {
                 geometryBuffers.push_back(const_cast<RenderBuffer *>(mesh.indexBuffer.ref));
@@ -354,6 +370,21 @@ namespace RT64 {
         std::sort(geometryBuffers.begin(), geometryBuffers.end());
         geometryBuffers.erase(std::unique(geometryBuffers.begin(), geometryBuffers.end()), geometryBuffers.end());
 
+        // The previous frame finished on the GPU before this one is recorded, so the pool is reused in place. Growing it
+        // with headroom keeps the allocation rare as the scene changes.
+        bottomLevelPoolUsed = poolNeeded;
+        if ((poolNeeded > 0) && ((bottomLevelPool == nullptr) || (poolNeeded > bottomLevelPoolCapacity))) {
+            bottomLevelPoolCapacity = roundUp(poolNeeded + poolNeeded / 2, 1ULL << 20);
+            bottomLevelPool = worker->device->createBuffer(RenderBufferDesc::AccelerationStructureBuffer(bottomLevelPoolCapacity));
+        }
+
+        if (bottomLevelPool != nullptr) {
+            for (BottomLevel &level : bottomLevelASVector) {
+                level.accelerationStructure = worker->device->createAccelerationStructure(RenderAccelerationStructureDesc(RenderAccelerationStructureType::BOTTOM_LEVEL,
+                    bottomLevelPool->at(level.offset), level.buildInfo.accelerationStructureSize));
+            }
+        }
+
         if (scratchNeeded > scratchCapacity) {
             scratchCapacity = roundUp(scratchNeeded, 256);
             scratchBuffer = worker->device->createBuffer(RenderBufferDesc::DefaultBuffer(scratchCapacity, RenderBufferFlag::ACCELERATION_STRUCTURE_SCRATCH | RenderBufferFlag::UNORDERED_ACCESS));
@@ -361,11 +392,15 @@ namespace RT64 {
     }
 
     void RaytracingResources::submitBottomLevelASCreation(RenderWorker *worker) {
-        if ((scratchBuffer == nullptr) || bottomLevelASVector.empty()) {
+        if ((scratchBuffer == nullptr) || (bottomLevelPool == nullptr) || bottomLevelASVector.empty()) {
             return;
         }
 
         worker->commandList->barriers(RenderBarrierStage::COMPUTE, RenderBufferBarrier(scratchBuffer.get(), RenderBufferAccess::WRITE));
+        worker->commandList->barriers(RenderBarrierStage::COMPUTE, RenderBufferBarrier(bottomLevelPool.get(), RenderBufferAccess::WRITE));
+
+        // After the first barrier, which ends any active render pass: query pools can't be reset inside one.
+        beginBuildTiming(worker);
         if (!geometryBuffers.empty()) {
             std::vector<RenderBufferBarrier> barriers;
             barriers.reserve(geometryBuffers.size());
@@ -375,12 +410,16 @@ namespace RT64 {
             worker->commandList->barriers(RenderBarrierStage::COMPUTE, barriers);
         }
 
-        for (BottomLevel &level : bottomLevelASVector) {
-            // The scratch buffer is reused. Each build must finish before the next one writes it.
-            worker->commandList->barriers(RenderBarrierStage::COMPUTE, RenderBufferBarrier(scratchBuffer.get(), RenderBufferAccess::WRITE));
-            worker->commandList->buildBottomLevelAS(level.accelerationStructure.get(), scratchBuffer->at(0), level.buildInfo);
-            worker->commandList->barriers(RenderBarrierStage::COMPUTE, RenderBufferBarrier(level.buffer.get(), RenderBufferAccess::WRITE));
+        for (size_t i = 0; i < bottomLevelASVector.size(); i++) {
+            BottomLevel &level = bottomLevelASVector[i];
+            if (level.newScratchBatch && (i > 0)) {
+                worker->commandList->barriers(RenderBarrierStage::COMPUTE, RenderBufferBarrier(scratchBuffer.get(), RenderBufferAccess::WRITE));
+            }
+
+            worker->commandList->buildBottomLevelAS(level.accelerationStructure.get(), scratchBuffer->at(level.scratchOffset), level.buildInfo);
         }
+
+        worker->commandList->barriers(RenderBarrierStage::COMPUTE, RenderBufferBarrier(bottomLevelPool.get(), RenderBufferAccess::WRITE));
 
         // Hand the geometry back to the raster passes. Trace rays transitions it again.
         if (!geometryBuffers.empty()) {
@@ -411,7 +450,7 @@ namespace RT64 {
             // the any-hit shaders.
             const uint32_t instanceID = (sceneInstance.renderIndex & 0x1FFFFFu) | (sceneInstance.proxy ? (1u << 21) : 0u) |
                 (sceneInstance.culling ? (1u << 22) : 0u) | (sceneInstance.alphaTested ? (1u << 23) : 0u);
-            instances.emplace_back(level.buffer->at(0), instanceID, mask, 0, cullDisable, RenderAffineTransform());
+            instances.emplace_back(bottomLevelPool->at(level.offset), instanceID, mask, 0, cullDisable, RenderAffineTransform());
         }
 
         if (instances.empty()) {

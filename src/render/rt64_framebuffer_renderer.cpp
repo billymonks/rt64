@@ -2690,10 +2690,10 @@ namespace RT64 {
         
         rtResources->prepareForDispatch(worker);
 
-        if (rtResources->topLevelAS == nullptr) {
+        if ((rtResources->topLevelAS == nullptr) || (rtResources->shaderBindingTableBuffer == nullptr) || (rtState == nullptr) || (rtState->pipeline == nullptr)) {
             static uint32_t missingCount = 0;
             if ((missingCount++ % 600) == 0) {
-                rtDiagLog("Skipping ray dispatch because the acceleration structure is missing (%u times).", missingCount);
+                rtDiagLog("Skipping ray dispatch because the acceleration structure or shader binding table is missing (%u times).", missingCount);
             }
             return;
         }
@@ -3153,6 +3153,7 @@ namespace RT64 {
 
                 rtResources->submitBottomLevelASCreation(worker);
                 rtResources->submitTopLevelASCreation(worker);
+                rtResources->endBuildTiming(worker);
             }
 
             if (outputBuffers != nullptr) {

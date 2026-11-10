@@ -382,6 +382,41 @@ namespace RT64 {
         activePassQueryPool = nullptr;
     }
 
+    void RaytracingResources::beginBuildTiming(RenderWorker *worker) {
+        const uint32_t slot = buildQueryFrame % PassTimingDepth;
+        buildQueryFrame++;
+        std::unique_ptr<RenderQueryPool> &pool = buildQueryPools[slot];
+        if (pool == nullptr) {
+            pool = worker->device->createQueryPool(2);
+        }
+        else if (buildQueryWritten[slot]) {
+            pool->queryResults();
+            const uint64_t *timestamps = pool->getResults();
+            if ((timestamps != nullptr) && (timestamps[1] >= timestamps[0])) {
+                const float sample = float(double(timestamps[1] - timestamps[0]) / 1000000.0);
+                accelerationBuildMs = (accelerationBuildMs > 0.0f) ? (accelerationBuildMs * 0.95f + sample * 0.05f) : sample;
+            }
+
+            buildQueryWritten[slot] = false;
+        }
+
+        activeBuildQueryPool = pool.get();
+        activeBuildQuerySlot = slot;
+        if (activeBuildQueryPool != nullptr) {
+            worker->commandList->resetQueryPool(activeBuildQueryPool, 0, 2);
+            worker->commandList->writeTimestamp(activeBuildQueryPool, 0);
+        }
+    }
+
+    void RaytracingResources::endBuildTiming(RenderWorker *worker) {
+        if (activeBuildQueryPool != nullptr) {
+            worker->commandList->writeTimestamp(activeBuildQueryPool, 1);
+            buildQueryWritten[activeBuildQuerySlot] = true;
+        }
+
+        activeBuildQueryPool = nullptr;
+    }
+
     void RaytracingResources::logUpscalerDiagnostics() {
         rtDiagLog("  upscaler: %s (requested %s), quality %s, sharpness %.0f%%; ray tracing %u x %u, display %u x %u (%.0f%% of the pixels)",
             upscalerKindName(activeUpscalerKind), upscalerKindName(requestedUpscaler), Upscaler::getQualityName(upscalerQuality), upscalerSharpness * 100.0f,
@@ -407,5 +442,7 @@ namespace RT64 {
         }
 
         rtDiagLog("%s", line);
+        rtDiagLog("  acceleration structure builds GPU ms (running average): %.3f for %zu bottom level structures (%.1f MB in a %.1f MB pool, %u scratch batches) and the top level",
+            accelerationBuildMs, bottomLevelASVector.size(), double(bottomLevelPoolUsed) / 1048576.0, double(bottomLevelPoolCapacity) / 1048576.0, bottomLevelScratchBatches);
     }
 };
