@@ -106,6 +106,12 @@ namespace interop {
         // are counted for the decal check (see RaytracingResources::decalRasterFallback).
         uint decalsPresent;
         uint decalCheck;
+        // Where the draws' emission words start in gRtMaterials (after one material word per draw), or 0 when no draw
+        // of the frame is emissive.
+        uint emissionOffset;
+        // Where the draws' foliage centers start in gRtMaterials (three words per draw: X, Z, radius), or 0 when no draw
+        // of the frame is foliage.
+        uint foliageOffset;
 
 #   ifdef HLSL_CPU
         RaytracingParams() {
@@ -164,6 +170,8 @@ namespace interop {
             diagDecal5 = 0;
             decalsPresent = 0;
             decalCheck = 0;
+            emissionOffset = 0;
+            foliageOffset = 0;
         }
 #   endif
     };

@@ -49,6 +49,7 @@ namespace RT64 {
         float roughness;
         float metalness;
         float specular;
+        float emission = 0.0f;
     };
 
     // Defaults per class. Being wrong about a shiny surface looks worse than being wrong about a matte one, so only
@@ -65,6 +66,11 @@ namespace RT64 {
         { "polished", 0.3f, 0.0f, 0.5f },
         { "metal", 0.35f, 0.7f, 0.6f },
         { "water", 0.06f, 0.0f, 1.0f },
+        // Glows in its texture's color; never guessed, only set by hand.
+        { "lava", 0.7f, 0.0f, 0.2f, 1.5f },
+        // Trees and bushes drawn as cutout planes: soft, wrapped lighting (see RtMaterialFoliageFlag). Upright unlit
+        // cutouts are treated this way anyway; the class forces it on for a texture.
+        { "foliage", 0.9f, 0.0f, 0.0f },
     };
 
     const char *rtMaterialClassName(RtMaterialClass materialClass) {
@@ -259,6 +265,24 @@ namespace RT64 {
             entry.roughness = value.value("roughness", info.roughness);
             entry.metalness = value.value("metalness", info.metalness);
             entry.specular = value.value("specular", info.specular);
+            // "emission": strength (the class default when missing); "emission color": "albedo" (the texture's color)
+            // or [r, g, b].
+            entry.emission = info.emission;
+            const auto emission = value.find("emission");
+            if ((emission != value.end()) && emission->is_number()) {
+                entry.emission = std::clamp(emission->get<float>(), 0.0f, 8.0f);
+            }
+
+            const auto emissionColor = value.find("emission color");
+            if ((emissionColor != value.end()) && emissionColor->is_array() && (emissionColor->size() >= 3) &&
+                (*emissionColor)[0].is_number() && (*emissionColor)[1].is_number() && (*emissionColor)[2].is_number())
+            {
+                entry.emissionFromTexture = false;
+                for (int c = 0; c < 3; c++) {
+                    entry.emissionColor[c] = std::clamp((*emissionColor)[c].get<float>(), 0.0f, 1.0f);
+                }
+            }
+
             entry.user = (value.value("source", std::string("guess")) == "user");
             entry.surface = value.value("on", std::string());
             entry.area = value.value("first seen", std::string());
@@ -267,6 +291,14 @@ namespace RT64 {
             entry.texture = value.value("texture", std::string());
             entry.preview = value.value("preview", std::string());
             entry.stats = value.value("stats", std::string());
+            float average[3];
+            const size_t averageAt = entry.stats.find("average color ");
+            if ((averageAt != std::string::npos) && (std::sscanf(entry.stats.c_str() + averageAt, "average color %f %f %f", &average[0], &average[1], &average[2]) == 3)) {
+                for (int c = 0; c < 3; c++) {
+                    entry.averageColor[c] = std::clamp(average[c], 0.0f, 1.0f);
+                }
+            }
+
             packEntry(entry);
             out[key] = entry;
         };
@@ -757,10 +789,16 @@ namespace RT64 {
     }
 
     void RtMaterialDatabase::loadManualLights(bool onlyIfChanged) {
+        // Players read only the shipped list; in authoring mode the Documents file overrides it and is hot reloaded.
+        const bool authoringMode = authoring;
         const std::filesystem::path local = localDirectory() / "rt_lights.json";
         const std::filesystem::path shipped = executableDirectory() / "assets" / "materials" / "rt_lights.json";
         std::error_code error;
-        const std::filesystem::file_time_type writeTime = std::filesystem::last_write_time(local, error);
+        if (!authoringMode && onlyIfChanged) {
+            return;
+        }
+
+        const std::filesystem::file_time_type writeTime = authoringMode ? std::filesystem::last_write_time(local, error) : std::filesystem::file_time_type{};
         if (onlyIfChanged) {
             std::scoped_lock lock(mutex);
             if (error || (writeTime == manualLightsWriteTime)) {
@@ -771,8 +809,8 @@ namespace RT64 {
         // The local file's lights win by id, even when disabled; the shipped list adds the ids it doesn't have.
         std::vector<RtManualLight> localLights;
         std::vector<RtRoomSetting> localSettings;
-        const bool localExists = std::filesystem::exists(local, error);
-        const bool localRead = readManualLights(local, localLights, localSettings, true);
+        const bool localExists = authoringMode && std::filesystem::exists(local, error);
+        const bool localRead = authoringMode && readManualLights(local, localLights, localSettings, true);
         if (onlyIfChanged && localExists && !localRead) {
             // Probably caught mid-save or broken by hand: keep the lights we have.
             std::scoped_lock lock(mutex);
@@ -805,17 +843,18 @@ namespace RT64 {
             std::scoped_lock lock(mutex);
             manualLights = merged;
             roomSettings = mergedSettings;
-            manualLightsFile = utf8(local);
+            manualLightsFile = authoringMode ? utf8(local) : utf8(shipped);
             manualLightsWriteTime = writeTime;
         }
 
         const size_t sunOff = size_t(std::count_if(mergedSettings.begin(), mergedSettings.end(), [](const RtRoomSetting &setting) { return !setting.sunAndMoon; }));
-        rtDiagLog("manual lights: %zu (%zu enabled) from %s%s; room settings: %zu (%zu with the sun and moon off)", merged->size(), enabled, utf8(local).c_str(),
-            localRead ? "" : " (not found, using the shipped list)", mergedSettings.size(), sunOff);
+        rtDiagLog("manual lights: %zu (%zu enabled; %zu from %s, %zu from the shipped %s); room settings: %zu (%zu with the sun and moon off)%s", merged->size(), enabled,
+            localLights.size(), authoringMode ? utf8(local).c_str() : "no Documents file", shippedLights.size(), utf8(shipped).c_str(), mergedSettings.size(), sunOff,
+            authoringMode ? (localRead ? "" : " (Documents file not found, using the shipped list)") : " (shipped configuration only)");
     }
 
     void RtMaterialDatabase::pollManualLights() {
-        if (!kManualLightsHotReload || !loaded) {
+        if (!kManualLightsHotReload || !loaded || !authoring) {
             return;
         }
 
@@ -840,7 +879,7 @@ namespace RT64 {
     }
 
     RtMaterialDatabase::~RtMaterialDatabase() {
-        if (loaded) {
+        if (loaded && authoring) {
             std::unordered_map<uint64_t, RtMaterialEntry> snapshot;
             std::unordered_map<uint64_t, RtEmitterEntry> emitterSnapshot;
             bool save = false;
@@ -911,6 +950,10 @@ namespace RT64 {
 
     std::string RtMaterialDatabase::path() {
         std::scoped_lock lock(mutex);
+        if (localPath.empty() && loaded) {
+            return utf8(executableDirectory() / "assets" / "materials" / "rt_materials.json") + " (shipped, read only)";
+        }
+
         return localPath;
     }
 
@@ -923,11 +966,23 @@ namespace RT64 {
     void RtMaterialDatabase::load() {
         const auto start = std::chrono::steady_clock::now();
         const std::filesystem::path directory = localDirectory();
-        migrateLegacyFiles(directory);
+        // Authoring mode: the Documents\Quest64Recompiled\Ray Tracing folder exists (or the old AppData files do, which
+        // move there). The Documents files then override the shipped ones and are saved with the HTML editors and
+        // texture previews. Players don't have the folder: the shipped files in assets\materials are the whole
+        // configuration, read only, and nothing is written.
+        std::error_code error;
+        const std::filesystem::path legacy = legacyDirectory();
+        const bool authoringMode = std::filesystem::is_directory(directory, error) ||
+            std::filesystem::exists(legacy / "rt_materials.json", error) || std::filesystem::exists(legacy / "rt_emitters.json", error);
+        authoring = authoringMode;
+        if (authoringMode) {
+            migrateLegacyFiles(directory);
+        }
+
         const std::filesystem::path local = directory / "rt_materials.json";
         const std::filesystem::path shipped = executableDirectory() / "assets" / "materials" / "rt_materials.json";
         std::unordered_map<uint64_t, RtMaterialEntry> localEntries;
-        const bool localRead = readEntries(local, localEntries);
+        const bool localRead = authoringMode && readEntries(local, localEntries);
 
         // The shipped file seeds the local one. Its user entries replace local guesses, so fixes made in the repo
         // reach players; local user entries always win.
@@ -949,7 +1004,7 @@ namespace RT64 {
         std::unordered_map<uint64_t, RtEmitterEntry> emitterEntries;
         int localLegacyGlow = -1;
         int shippedLegacyGlow = -1;
-        const bool localEmittersRead = readEmitters(localEmitters, emitterEntries, &localLegacyGlow);
+        const bool localEmittersRead = authoringMode && readEmitters(localEmitters, emitterEntries, &localLegacyGlow);
         std::unordered_map<uint64_t, RtEmitterEntry> seededEmitters;
         uint32_t seededEmitterCount = 0;
         if (readEmitters(shippedEmitters, seededEmitters, &shippedLegacyGlow)) {
@@ -987,8 +1042,9 @@ namespace RT64 {
 
         {
             std::scoped_lock lock(mutex);
-            localPath = utf8(local);
-            previewDirectory = utf8(directory / "rt_materials");
+            // Without authoring there's no local file: the paths stay empty, so nothing is saved or previewed.
+            localPath = authoringMode ? utf8(local) : std::string();
+            previewDirectory = authoringMode ? utf8(directory / "rt_materials") : std::string();
             for (auto &pair : localEntries) {
                 entries.emplace(pair.first, pair.second);
             }
@@ -1023,9 +1079,17 @@ namespace RT64 {
         loadManualLights(false);
         loaded = true;
         const double milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-        rtDiagLog("materials: %zu entries, %zu user entries from %s (%s), %u taken from %s; emitters: %zu entries, %zu user entries from %s (%s), %u taken from the shipped list; loaded in %.1f ms on a background thread",
-            count, userCount, utf8(local).c_str(), localRead ? "read" : "not found, created on first save", seededCount, utf8(shipped).c_str(),
-            emitterCount, userEmitterCount, utf8(localEmitters).c_str(), localEmittersRead ? "read" : "not found, created on first save", seededEmitterCount, milliseconds);
+        if (authoringMode) {
+            rtDiagLog("materials: authoring mode (%s exists): Documents files override the shipped ones and are saved, with the HTML editors and previews",
+                utf8(directory).c_str());
+            rtDiagLog("materials: %zu entries, %zu user entries from %s (%s), %u taken from %s; emitters: %zu entries, %zu user entries from %s (%s), %u taken from the shipped list; loaded in %.1f ms on a background thread",
+                count, userCount, utf8(local).c_str(), localRead ? "read" : "not found, created on first save", seededCount, utf8(shipped).c_str(),
+                emitterCount, userEmitterCount, utf8(localEmitters).c_str(), localEmittersRead ? "read" : "not found, created on first save", seededEmitterCount, milliseconds);
+        }
+        else {
+            rtDiagLog("materials: shipped configuration only (no %s, so nothing is written): %zu material entries (%zu user) from %s; %zu emitter entries (%zu user) from %s; loaded in %.1f ms on a background thread",
+                utf8(directory).c_str(), count, userCount, utf8(shipped).c_str(), emitterCount, userEmitterCount, utf8(shippedEmitters).c_str(), milliseconds);
+        }
     }
 
     // A self-contained editor page for rt_emitters.json or rt_materials.json: the file's contents are embedded, every
@@ -1109,9 +1173,14 @@ function emitterRow(e,listed){
   el('td',{},'only kinds',kinds,'only areas ',areas),
   el('td',{},match));
 }
-const CLASSES=['matte','sprite','grass','dirt','wood','cloth','skin','stone','polished','metal','water'];
+const CLASSES=['matte','sprite','grass','dirt','wood','cloth','skin','stone','polished','metal','water','lava','foliage'];
 function materialRow(e){
- const cls=el('select',{on:{change:ev=>{e.class=ev.target.value;touch(e);}}},...CLASSES.map(c=>el('option',{value:c,selected:e.class===c},c)));
+ const cls=el('select',{on:{change:ev=>{e.class=ev.target.value;if(e.class==='lava'&&!(e.emission>0)){e.roughness=0.7;e.metalness=0;e.specular=0.2;e.emission=1.5;e['emission color']='albedo';}touch(e);render();}}},...CLASSES.map(c=>el('option',{value:c,selected:e.class===c},c)));
+ const fromTexture=!Array.isArray(e['emission color']);
+ const emitPicker=el('input',{type:'color',value:rgbToHex(Array.isArray(e['emission color'])?e['emission color']:[1,0.4,0.1]),disabled:fromTexture,on:{input:ev=>{e['emission color']=hexToRgb(ev.target.value);touch(e);}}});
+ const emitTexture=el('input',{type:'checkbox',checked:fromTexture,on:{change:ev=>{if(ev.target.checked){e['emission color']='albedo';emitPicker.disabled=true;}else{e['emission color']=hexToRgb(emitPicker.value);emitPicker.disabled=false;}touch(e);}}});
+ const emitOut=el('span',{className:'val'},(e.emission??0).toFixed(2));
+ const emitSlider=el('input',{type:'range',min:0,max:4,step:0.05,value:e.emission??0,title:'Light the surface gives off: 0 none, 1 its full texture colour, more glows brighter and lights its surroundings',on:{input:ev=>{e.emission=parseFloat(ev.target.value);emitOut.textContent=e.emission.toFixed(2);touch(e);}}});
  const label=el('input',{type:'text',className:'label',value:e.label||'',on:{change:ev=>{e.label=ev.target.value;touch(e);}}});
  return el('tr',{className:changed.has(e.key)?'changed':''},
   el('td',{},thumb(e)),
@@ -1119,6 +1188,7 @@ function materialRow(e){
   el('td',{},label,el('div',{className:'small'},(e.on||'')+' · '+(e.texture||''))),
   el('td',{},'class ',cls),
   el('td',{},'roughness ',slider(e,'roughness'),el('br'),'metalness ',slider(e,'metalness'),el('br'),'specular ',slider(e,'specular')),
+  el('td',{},'emission ',el('span',{},emitSlider,emitOut),el('br'),el('label',{className:'chk'},emitTexture,'texture colour'),' ',emitPicker),
   el('td',{className:'small'},e.stats||''));
 }
 function entries(){return MODE==='emitters'?[...(doc.emitters||[]).map(e=>[e,true]),...(doc.candidates||[]).map(e=>[e,false])]:(doc.materials||[]).map(e=>[e,true]);}
@@ -1325,6 +1395,17 @@ fillAreas();render();
             value["roughness"] = std::round(entry.roughness * 100.0f) / 100.0f;
             value["metalness"] = std::round(entry.metalness * 100.0f) / 100.0f;
             value["specular"] = std::round(entry.specular * 100.0f) / 100.0f;
+            if ((entry.emission > 0.0f) || (kClassInfo[size_t(entry.materialClass)].emission > 0.0f)) {
+                value["emission"] = std::round(entry.emission * 100.0f) / 100.0f;
+                if (entry.emissionFromTexture) {
+                    value["emission color"] = "albedo";
+                }
+                else {
+                    value["emission color"] = { std::round(entry.emissionColor[0] * 1000.0f) / 1000.0f, std::round(entry.emissionColor[1] * 1000.0f) / 1000.0f,
+                        std::round(entry.emissionColor[2] * 1000.0f) / 1000.0f };
+                }
+            }
+
             value["source"] = entry.user ? "user" : "guess";
             value["on"] = entry.surface;
             value["first seen"] = entry.area;
@@ -1601,7 +1682,8 @@ fillAreas();render();
     }
 
     void RtMaterialDatabase::saveIfDirty(uint32_t frame, bool force) {
-        if (!loaded) {
+        // Players (no authoring) keep everything in memory.
+        if (!loaded || !authoring) {
             return;
         }
 
@@ -1632,6 +1714,37 @@ fillAreas();render();
         return (it != entries.end()) ? it->second.packed : 0u;
     }
 
+    bool RtMaterialDatabase::emissiveMaterial(uint64_t key, uint32_t &packedEmission, float radiance[3]) {
+        if (!loaded) {
+            return false;
+        }
+
+        std::scoped_lock lock(mutex);
+        auto it = entries.find(key);
+        if ((it == entries.end()) || (it->second.emission <= 0.0f)) {
+            return false;
+        }
+
+        // Strength in 1/32 steps up to 8 in the top byte; the color below, or 0 for the texture's own color.
+        const RtMaterialEntry &entry = it->second;
+        const uint32_t strength = uint32_t(std::clamp(std::lround(entry.emission * 32.0f), 1L, 255L));
+        uint32_t color = 0;
+        if (!entry.emissionFromTexture) {
+            for (int c = 0; c < 3; c++) {
+                color |= uint32_t(std::clamp(std::lround(entry.emissionColor[c] * 255.0f), 0L, 255L)) << (c * 8);
+            }
+
+            color = std::max(color, 1u);
+        }
+
+        packedEmission = (strength << 24) | color;
+        for (int c = 0; c < 3; c++) {
+            radiance[c] = (entry.emissionFromTexture ? entry.averageColor[c] : entry.emissionColor[c]) * entry.emission;
+        }
+
+        return true;
+    }
+
     bool RtMaterialDatabase::find(uint64_t key, RtMaterialEntry &entry) {
         std::scoped_lock lock(mutex);
         auto it = entries.find(key);
@@ -1653,8 +1766,9 @@ fillAreas();render();
             return false;
         }
 
+        // Players use the shipped entries as they are; only textures the shipped list lacks are guessed (in memory).
         auto entry = entries.find(key);
-        if ((entry != entries.end()) && entry->second.user) {
+        if ((entry != entries.end()) && (entry->second.user || !authoring)) {
             return false;
         }
 
@@ -1672,7 +1786,8 @@ fillAreas();render();
     }
 
     bool RtMaterialDatabase::wantsPreview(uint64_t key) {
-        if (!loaded || (key == 0)) {
+        // Previews are for the HTML editors, which only exist in authoring mode.
+        if (!loaded || !authoring || (key == 0)) {
             return false;
         }
 
@@ -1863,6 +1978,11 @@ fillAreas();render();
         std::snprintf(statsText, sizeof(statsText), "average color %.2f %.2f %.2f, saturation %.2f, variation %.2f, %u triangles",
             stats.color[0], stats.color[1], stats.color[2], saturation, stats.luminanceDeviation, placement.triangleCount);
         entry.stats = statsText;
+        entry.emission = info.emission;
+        for (int c = 0; c < 3; c++) {
+            entry.averageColor[c] = std::clamp(stats.color[c], 0.0f, 1.0f);
+        }
+
         packEntry(entry);
 
         const bool changed = (it == entries.end()) || (previousClass != entry.materialClass) || (it->second.label != entry.label);

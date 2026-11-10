@@ -1294,21 +1294,98 @@ namespace RT64 {
         frameManualLightIds.clear();
         emitterList.pollManualLights();
         const std::shared_ptr<const std::vector<RtManualLight>> manual = emitterList.manualLightList();
+        frameManualLights.clear();
+        frameAreaManualLights = 0;
+        static const auto start = std::chrono::steady_clock::now();
+        const float seconds = std::chrono::duration<float>(std::chrono::steady_clock::now() - start).count();
+        const float fadeStep = std::clamp((seconds - manualLightsLastSeconds) / ManualLightFadeSeconds, 0.0f, 1.0f);
+        manualLightsLastSeconds = seconds;
         if (manual && (rtScene.areaMap >= 0)) {
-            static const auto start = std::chrono::steady_clock::now();
-            const float seconds = std::chrono::duration<float>(std::chrono::steady_clock::now() - start).count();
-            uint32_t added = 0;
-            uint32_t skipped = 0;
+            // Every light of the area is ranked each frame by how much it can light near the camera: brighter and
+            // wider lights win, closer ones more so. Lights whose reach ends too far from the camera to light anything
+            // on screen are left out. The MaxManualLights best are shown; a light already shown ranks a little higher,
+            // so two similar lights don't trade places from frame to frame. Lights fade in and out over
+            // ManualLightFadeSeconds as they join and leave the set, and keep the file's order in the light list.
+            struct Ranked {
+                const RtManualLight *light;
+                float score;
+                float distance;
+            };
+
+            std::vector<Ranked> ranked;
             for (const RtManualLight &manualLight : *manual) {
                 if (!manualLight.enabled || (manualLight.map != rtScene.areaMap) || ((manualLight.room >= 0) && (manualLight.room != rtScene.areaRoom))) {
                     continue;
                 }
 
-                if (added >= MaxManualLights) {
-                    skipped++;
+                frameAreaManualLights++;
+                if (ranked.size() >= MaxAreaManualLights) {
                     continue;
                 }
 
+                float distanceSquared = 0.0f;
+                for (int c = 0; c < 3; c++) {
+                    const float delta = manualLight.position[c] - cameraPosition[c];
+                    distanceSquared += delta * delta;
+                }
+
+                const float distance = std::sqrt(distanceSquared);
+                if ((distance - manualLight.range) > ManualLightViewReach) {
+                    continue;
+                }
+
+                const float brightness = manualLight.intensity * std::max(manualLight.color[0], std::max(manualLight.color[1], manualLight.color[2]));
+                const float nearest = std::max(manualLight.range * 0.25f, 1.0f);
+                float score = brightness * manualLight.range * manualLight.range / std::max(distanceSquared, nearest * nearest);
+                auto state = manualLightFades.find(manualLight.id);
+                if ((state != manualLightFades.end()) && state->second.selected) {
+                    score *= ManualLightHysteresis;
+                }
+
+                ranked.push_back({ &manualLight, score, distance });
+            }
+
+            if ((frameAreaManualLights > MaxAreaManualLights) && !manualLightCapLogged) {
+                rtDiagLog("manual lights: map %d room %d has %u lights; only the first %u are considered", rtScene.areaMap, rtScene.areaRoom, frameAreaManualLights, MaxAreaManualLights);
+                manualLightCapLogged = true;
+            }
+
+            const size_t selectedCount = std::min(ranked.size(), size_t(MaxManualLights));
+            std::partial_sort(ranked.begin(), ranked.begin() + selectedCount, ranked.end(), [](const Ranked &a, const Ranked &b) { return a.score > b.score; });
+            for (auto &pair : manualLightFades) {
+                pair.second.selected = false;
+                pair.second.seen = false;
+            }
+
+            for (size_t i = 0; i < ranked.size(); i++) {
+                ManualLightState &state = manualLightFades[ranked[i].light->id];
+                state.selected = (i < selectedCount);
+                state.seen = true;
+                state.distance = ranked[i].distance;
+                state.score = ranked[i].score;
+            }
+
+            // Lights no longer in the area (another room, removed from the file) are dropped at once.
+            for (auto it = manualLightFades.begin(); it != manualLightFades.end();) {
+                ManualLightState &state = it->second;
+                state.fade = state.selected ? std::min(state.fade + fadeStep, 1.0f) : (state.fade - fadeStep);
+                if (!state.seen || (state.fade <= 0.0f)) {
+                    it = manualLightFades.erase(it);
+                }
+                else {
+                    ++it;
+                }
+            }
+
+            for (const RtManualLight &manualLight : *manual) {
+                auto stateIt = manualLightFades.find(manualLight.id);
+                if ((stateIt == manualLightFades.end()) || !manualLight.enabled || (manualLight.map != rtScene.areaMap) ||
+                    ((manualLight.room >= 0) && (manualLight.room != rtScene.areaRoom)))
+                {
+                    continue;
+                }
+
+                const ManualLightState &state = stateIt->second;
                 // Flicker on the intensity: three waves at unrelated speeds, offset per light.
                 float flicker = 1.0f;
                 if (manualLight.flicker > 0.0f) {
@@ -1319,7 +1396,7 @@ namespace RT64 {
                     flicker = 1.0f - manualLight.flicker * 0.5f * (1.0f - wave);
                 }
 
-                const float scale = manualLight.intensity * flicker;
+                const float scale = manualLight.intensity * flicker * state.fade;
                 interop::PointLight light = {};
                 light.position = { manualLight.position[0], manualLight.position[1], manualLight.position[2] };
                 light.direction = { 0.0f, 0.0f, 0.0f };
@@ -1332,12 +1409,97 @@ namespace RT64 {
                 light.groupBits = 0xFFu | kEmissiveLightFlag | kEmissiveNoSampleFlag | (manualLight.castsShadows ? 0u : kManualNoShadowFlag);
                 frameLights.push_back(light);
                 frameManualLightIds.push_back(manualLight.id);
-                added++;
+                frameManualLights.push_back({ manualLight.id, state.distance, state.fade, state.score, state.selected });
+            }
+        }
+        else {
+            manualLightFades.clear();
+        }
+
+        // Lava lights: the emissive cells nearest the camera, each a light a little above the surface, colored by the
+        // material's average texture color times its emission and reaching further from larger cells.
+        frameLavaLightCount = 0;
+        if (!rtScene.emissiveCells.empty() || !lavaLights.empty()) {
+            const float FadeIn = 0.15f;
+            const float FadeOut = 0.1f;
+            const float LightHeight = 12.0f;
+            struct Candidate {
+                int64_t cell;
+                float position[3];
+                float radiance[3];
+                float area;
+                float distance;
+            };
+
+            std::vector<Candidate> candidates;
+            candidates.reserve(rtScene.emissiveCells.size());
+            for (const auto &pair : rtScene.emissiveCells) {
+                const RaytracingScene::EmissiveCell &cell = pair.second;
+                if (cell.area <= 1e-3f) {
+                    continue;
+                }
+
+                Candidate candidate;
+                candidate.cell = pair.first;
+                candidate.area = cell.area;
+                const float normalLength = std::sqrt(cell.normal[0] * cell.normal[0] + cell.normal[1] * cell.normal[1] + cell.normal[2] * cell.normal[2]);
+                float distanceSquared = 0.0f;
+                for (int c = 0; c < 3; c++) {
+                    const float normal = (normalLength > 1e-6f) ? (cell.normal[c] / normalLength) : ((c == 1) ? 1.0f : 0.0f);
+                    candidate.position[c] = cell.position[c] / cell.area + normal * LightHeight;
+                    candidate.radiance[c] = cell.radiance[c] / cell.area;
+                    const float delta = candidate.position[c] - cameraPosition[c];
+                    distanceSquared += delta * delta;
+                }
+
+                candidate.distance = distanceSquared;
+                candidates.push_back(candidate);
             }
 
-            if ((skipped > 0) && !manualLightCapLogged) {
-                rtDiagLog("manual lights: %u lights of map %d room %d skipped, only %u per area are used", skipped, rtScene.areaMap, rtScene.areaRoom, MaxManualLights);
-                manualLightCapLogged = true;
+            const size_t selectedCount = std::min(candidates.size(), size_t(MaxLavaLights));
+            std::partial_sort(candidates.begin(), candidates.begin() + selectedCount, candidates.end(), [](const Candidate &a, const Candidate &b) { return a.distance < b.distance; });
+            for (LavaLight &light : lavaLights) {
+                light.selected = false;
+            }
+
+            for (size_t i = 0; i < selectedCount; i++) {
+                const Candidate &candidate = candidates[i];
+                auto it = std::find_if(lavaLights.begin(), lavaLights.end(), [&](const LavaLight &light) { return light.cell == candidate.cell; });
+                if (it == lavaLights.end()) {
+                    lavaLights.emplace_back();
+                    it = lavaLights.end() - 1;
+                    it->cell = candidate.cell;
+                }
+
+                it->selected = true;
+                const float size = std::sqrt(candidate.area);
+                for (int c = 0; c < 3; c++) {
+                    it->position[c] = candidate.position[c];
+                    it->radiance[c] = candidate.radiance[c];
+                }
+
+                it->range = std::clamp(60.0f + size * 1.5f, 80.0f, 320.0f);
+                it->radius = std::clamp(size * 0.4f, 4.0f, 32.0f);
+            }
+
+            for (LavaLight &light : lavaLights) {
+                light.fade = light.selected ? std::min(light.fade + FadeIn, 1.0f) : (light.fade - FadeOut);
+            }
+
+            lavaLights.erase(std::remove_if(lavaLights.begin(), lavaLights.end(), [](const LavaLight &light) { return light.fade <= 0.0f; }), lavaLights.end());
+            for (const LavaLight &lava : lavaLights) {
+                interop::PointLight light = {};
+                light.position = { lava.position[0], lava.position[1], lava.position[2] };
+                light.direction = { 0.0f, 0.0f, 0.0f };
+                light.diffuseColor = { lava.radiance[0] * lava.fade, lava.radiance[1] * lava.fade, lava.radiance[2] * lava.fade };
+                light.specularColor = light.diffuseColor;
+                light.attenuationRadius = lava.range;
+                light.pointRadius = lava.radius;
+                light.flickerIntensity = 0.0f;
+                light.shadowOffset = 0.0f;
+                light.groupBits = 0xFFu | kEmissiveLightFlag | kEmissiveNoSampleFlag;
+                frameLights.push_back(light);
+                frameLavaLightCount++;
             }
         }
 
@@ -1411,7 +1573,7 @@ namespace RT64 {
         return debugViewMode.load();
     }
 
-    // Diffuse bounces of the indirect light: set from the Graphics menu's "Second light bounce", toggled by Shift+F10.
+    // Diffuse bounces of the indirect light. The game always sets 1; the second bounce stays in the shaders, unused.
     static std::atomic<uint32_t> indirectBounceCount(1);
 
     void setRaytracingIndirectBounces(uint32_t bounces) {
@@ -1421,7 +1583,7 @@ namespace RT64 {
     void toggleRaytracingSecondBounce() {
         const uint32_t bounces = (indirectBounceCount.load() >= 2) ? 1u : 2u;
         indirectBounceCount.store(bounces);
-        rtDiagLog("indirect light: %u bounce%s (Shift+F10 toggles until the Graphics menu applies its setting again)", bounces, (bounces == 1) ? "" : "s");
+        rtDiagLog("indirect light: %u bounce%s", bounces, (bounces == 1) ? "" : "s");
     }
 
     uint32_t raytracingIndirectBounces() {
@@ -1531,6 +1693,29 @@ namespace RT64 {
                 info.alphaTested ? ", texels tested by alpha" : "", info.combiner[0], info.combiner[1], info.primAlpha, info.envAlpha, info.queryMask,
                 (info.queryMask == RtDecalRayMask) ? "the camera ray's decal query only" : "camera rays", info.culling ? "back faces culled like the raster" : "no culling");
         }
+
+        rtDiagLog("  foliage: %u path traced draws shaded as foliage (camera facing billboards with a shadow proxy, upright cutouts without N64 lighting, or class foliage in rt_materials.json); %u billboard proxies",
+            rtScene.foliageDraws, rtScene.billboardProxies);
+
+        // Emissive materials (rt_materials.json "emission", class lava) and the lights they cast.
+        uint32_t emissiveTriangles = 0;
+        for (const RaytracingScene::EmissiveDraw &draw : rtScene.emissiveDraws) {
+            emissiveTriangles += draw.triangles;
+        }
+
+        rtDiagLog("  emissive materials: %zu draws (%u triangles) in %zu cells of %g units; %u lava lights (max %u)%s", rtScene.emissiveDraws.size(), emissiveTriangles,
+            rtScene.emissiveCells.size(), 96.0, frameLavaLightCount, MaxLavaLights, (rtParams.emissionOffset != 0) ? "" : "; no emissive draws, so the shaders skip emission");
+        for (size_t d = 0; d < std::min(rtScene.emissiveDraws.size(), size_t(16)); d++) {
+            const RaytracingScene::EmissiveDraw &draw = rtScene.emissiveDraws[d];
+            rtDiagLog("    emissive draw %u: texture %016llX, %u triangles, light color %.2f %.2f %.2f", draw.renderIndex, (unsigned long long)draw.key, draw.triangles,
+                draw.radiance[0], draw.radiance[1], draw.radiance[2]);
+        }
+
+        for (const LavaLight &lava : lavaLights) {
+            rtDiagLog("    lava light at %.0f %.0f %.0f: color %.2f %.2f %.2f, range %.0f, radius %.0f, fade %.2f%s", lava.position[0], lava.position[1], lava.position[2],
+                lava.radiance[0], lava.radiance[1], lava.radiance[2], lava.range, lava.radius, lava.fade, lava.selected ? "" : " (fading out)");
+        }
+
         if (!raytracingAdvancedWater()) {
             rtDiagLog("  water: Advanced Water Rendering is off (Graphics menu); water stays rasterized after the path traced pass");
         }
@@ -1651,13 +1836,18 @@ namespace RT64 {
             const std::shared_ptr<const std::vector<RtManualLight>> manual = rtMaterialDatabase().manualLightList();
             const size_t loadedLights = manual ? manual->size() : 0;
             const size_t enabledLights = manual ? size_t(std::count_if(manual->begin(), manual->end(), [](const RtManualLight &light) { return light.enabled; })) : 0;
-            std::string active;
-            for (const std::string &id : frameManualLightIds) {
-                active += (active.empty() ? "" : ", ") + id;
+            uint32_t shown = 0;
+            for (const ManualLightInfo &info : frameManualLights) {
+                shown += info.selected ? 1 : 0;
             }
 
-            rtDiagLog("  manual lights: %zu loaded (%zu enabled) from %s; %zu active in map %d room %d: %s", loadedLights, enabledLights,
-                rtMaterialDatabase().manualLightsPath().c_str(), frameManualLightIds.size(), rtScene.areaMap, rtScene.areaRoom, active.empty() ? "none" : active.c_str());
+            rtDiagLog("  manual lights: %zu loaded (%zu enabled) from %s; map %d room %d has %u, the nearest %u (most important for the camera) are shown at once: %u shown, %zu in the light list with the ones fading out",
+                loadedLights, enabledLights, rtMaterialDatabase().manualLightsPath().c_str(), rtScene.areaMap, rtScene.areaRoom, frameAreaManualLights, MaxManualLights, shown,
+                frameManualLights.size());
+            for (const ManualLightInfo &info : frameManualLights) {
+                rtDiagLog("    manual light %s: %.0f units from the camera, fade %.2f, rank score %.1f%s", info.id.c_str(), info.distance, info.fade, info.score,
+                    info.selected ? "" : " (fading out)");
+            }
             rtDiagLog("  room settings: sun and moon %s for map %d room %d (from %s, %s)", (rtParams.sunDisabled != 0) ? "OFF" : "ON", rtScene.areaMap, rtScene.areaRoom,
                 sunSettingSource, sunSettingScope);
         }
@@ -2214,7 +2404,7 @@ namespace RT64 {
             rtDiagLog("  note: the center lines describe whatever is exactly at the screen center, often the scenery behind the character in third person view");
             float bounceFill[7];
             memcpy(bounceFill, &counters[35], sizeof(bounceFill));
-            rtDiagLog("  indirect light: %u bounce%s (Graphics menu \"Second light bounce\", Shift+F10 toggles); center pixel fill this frame from bounce 1 %.3f %.3f %.3f, from bounce 2 %.3f %.3f %.3f, fill strength %.2f",
+            rtDiagLog("  indirect light: %u bounce%s; center pixel fill this frame from bounce 1 %.3f %.3f %.3f, from bounce 2 %.3f %.3f %.3f, fill strength %.2f",
                 counters[42], (counters[42] == 1) ? "" : "s", bounceFill[0], bounceFill[1], bounceFill[2], bounceFill[3], bounceFill[4], bounceFill[5], bounceFill[6]);
             if (counters[44] == 4) {
                 rtDiagLog("  water: center pixel is on a scrolling surface the water pass skipped because its color isn't blue or blue-green (draw %u); %u water pixels this frame",
@@ -2231,6 +2421,27 @@ namespace RT64 {
                 rtDiagLog("  water: center pixel is not water; %u water pixels this frame", counters[43]);
             }
             rtDiagLog("  decals: %u camera hits on path traced decals this frame, %u of them blended over the surface below by the decal's alpha", counters[49], counters[50]);
+            float centerEmission[3];
+            memcpy(centerEmission, &counters[201], sizeof(centerEmission));
+            rtDiagLog("  emission: center pixel %s (emitted color %.2f %.2f %.2f); %u emissive pixels this frame", (counters[200] != 0) ? "IS emissive" : "is not emissive",
+                centerEmission[0], centerEmission[1], centerEmission[2], counters[204]);
+            float foliageNormal[3];
+            memcpy(foliageNormal, &counters[206], sizeof(foliageNormal));
+            if (counters[205] != 0) {
+                rtDiagLog("  foliage: center pixel IS foliage, soft normal %.3f %.3f %.3f (wrapped light, no self shadowing); %u foliage pixels this frame",
+                    foliageNormal[0], foliageNormal[1], foliageNormal[2], counters[209]);
+            }
+            else {
+                rtDiagLog("  foliage: center pixel is not foliage; %u foliage pixels this frame", counters[209]);
+            }
+
+            // The terms of the center pixel's color, one per line item, to tell a shadow from the game's own vertex
+            // shading: albedo (the texture and vertex shade combined) and the shade alone, the sun's visibility and
+            // facing (see "center surface" for the direct factor and the bounce fill) and the proxy skips.
+            float centerShade[3];
+            memcpy(centerShade, &counters[210], sizeof(centerShade));
+            rtDiagLog("  center terms: vertex shade %.3f %.3f %.3f (draw %u; N64 lighting of lit vertices, baked into the albedo; if it differs between the two halves of a tree, the game's own shading has the seam), billboard shadow ray hits on nearby proxies skipped this frame %u",
+                centerShade[0], centerShade[1], centerShade[2], counters[213], counters[214]);
             rtDiagLog("  indirect pass GPU time: %.3f ms average with 1 bounce, %.3f ms with 2 bounces (0 = not measured yet in that mode)",
                 indirectPassMs[0], indirectPassMs[1]);
             rtDiagLog("  center surface: sun visibility %.2f, N.L %.2f, direct factor %.3f; emissive light added %.3f %.3f %.3f; specular added %.3f %.3f %.3f with diffuse kept %.2f; bounce fill %.3f %.3f %.3f, ambient occlusion %.2f (1 = open)",

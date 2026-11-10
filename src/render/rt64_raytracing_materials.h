@@ -35,6 +35,8 @@ namespace RT64 {
         PolishedFloor,
         Metal,
         Water,
+        Lava,
+        Foliage,
         Count
     };
 
@@ -70,6 +72,13 @@ namespace RT64 {
         float roughness = 0.9f;
         float metalness = 0.0f;
         float specular = 0.0f;
+        // Light the surface gives off ("emission" in rt_materials.json): its texture color (or "emission color")
+        // times this, on top of its lighting. Lava glows this way.
+        float emission = 0.0f;
+        bool emissionFromTexture = true;
+        float emissionColor[3] = { 1.0f, 1.0f, 1.0f };
+        // Average texture color from "stats", for the color of the lights an emissive surface casts.
+        float averageColor[3] = { 0.5f, 0.5f, 0.5f };
         bool user = false;
         uint32_t packed = 0;
         // Readable context, kept from the first time the texture was seen.
@@ -287,6 +296,9 @@ namespace RT64 {
         void loadOnce();
         // Packed material of a texture for gRtMaterials, 0 when unknown.
         uint32_t packedMaterial(uint64_t key);
+        // An emissive texture's emission for gRtMaterials (strength in the top byte, color in the rest, 0 for the
+        // texture's color) and the light it gives off (average color times strength). False when not emissive.
+        bool emissiveMaterial(uint64_t key, uint32_t &packedEmission, float radiance[3]);
         // True once per session for a texture without a user entry, until a probe for it is pending.
         bool wantsProbe(uint64_t key, uint32_t frame);
         void markProbePending(uint64_t key, uint32_t frame);
@@ -343,6 +355,9 @@ namespace RT64 {
         std::mutex mutex;
         std::atomic<bool> loadStarted = false;
         std::atomic<bool> loaded = false;
+        // Authoring mode (see load): the Documents folder exists, so its files override the shipped ones and are saved.
+        // Otherwise the shipped files are the whole configuration and nothing is written.
+        std::atomic<bool> authoring = false;
         bool dirty = false;
         uint32_t lastSaveFrame = 0;
         std::string localPath;

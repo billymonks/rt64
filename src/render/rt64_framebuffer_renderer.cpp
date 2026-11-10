@@ -904,6 +904,125 @@ namespace RT64 {
         return std::sqrt(dx * dx + dy * dy + dz * dz);
     }
 
+    static uint32_t floatBits(float value) {
+        uint32_t bits;
+        memcpy(&bits, &value, sizeof(bits));
+        return bits;
+    }
+
+    // Upright cutout planes drawn without N64 lighting (vertex colors, not normals): trees and bushes. Lit cutouts are
+    // parts of characters (capes, hair), which keep their own normals.
+    static bool looksLikeFoliage(const DrawData &drawData, uint32_t indexStart, uint32_t triangleCount) {
+        const uint32_t SampledTriangles = 4;
+        uint32_t upright = 0;
+        uint32_t sampled = 0;
+        for (uint32_t t = 0; (t < triangleCount) && (sampled < SampledTriangles); t++) {
+            float p[3][3];
+            bool valid = true;
+            for (uint32_t k = 0; (k < 3) && valid; k++) {
+                const uint32_t index = indexStart + t * 3 + k;
+                const interop::float4x4 *transform = nullptr;
+                valid = (index < drawData.faceIndices.size()) && scenePosition(drawData, drawData.faceIndices[index], p[k][0], p[k][1], p[k][2], transform);
+                if (valid) {
+                    const uint32_t vertex = drawData.faceIndices[index];
+                    if ((vertex < drawData.lightCounts.size()) && (drawData.lightCounts[vertex] > 0)) {
+                        return false;
+                    }
+                }
+            }
+
+            if (!valid) {
+                continue;
+            }
+
+            const float e1[3] = { p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2] };
+            const float e2[3] = { p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2] };
+            const float n[3] = { e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0] };
+            const float length = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+            if (!(length > 1e-6f)) {
+                continue;
+            }
+
+            sampled++;
+            upright += (std::fabs(n[1] / length) < 0.5f) ? 1 : 0;
+        }
+
+        return (sampled > 0) && ((upright * 2) > sampled);
+    }
+
+    // Center (XZ) and radius of a foliage draw: the axis its soft normal points away from. A draw spread wider than a
+    // tree (a row of bushes in one draw) gets radius 0, and the shader uses each triangle's own center instead.
+    static void foliageBounds(const DrawData &drawData, uint32_t indexStart, uint32_t indexCount, float center[2], float &radius) {
+        const float MaxTreeSpan = 200.0f;
+        float minX = FLT_MAX, maxX = -FLT_MAX, minZ = FLT_MAX, maxZ = -FLT_MAX;
+        const uint32_t step = std::max(indexCount / 96u, 1u);
+        for (uint32_t i = 0; (i < indexCount) && ((indexStart + i) < drawData.faceIndices.size()); i += step) {
+            const interop::float4x4 *transform = nullptr;
+            float x, y, z;
+            if (scenePosition(drawData, drawData.faceIndices[indexStart + i], x, y, z, transform)) {
+                minX = std::min(minX, x);
+                maxX = std::max(maxX, x);
+                minZ = std::min(minZ, z);
+                maxZ = std::max(maxZ, z);
+            }
+        }
+
+        center[0] = center[1] = 0.0f;
+        radius = 0.0f;
+        if ((maxX >= minX) && (std::max(maxX - minX, maxZ - minZ) <= MaxTreeSpan)) {
+            center[0] = (minX + maxX) * 0.5f;
+            center[1] = (minZ + maxZ) * 0.5f;
+            radius = std::max(std::max(maxX - minX, maxZ - minZ) * 0.5f, 1.0f);
+        }
+    }
+
+    // Adds an emissive draw's triangles to the cells of a world grid, weighted by area: the lava lights are placed at
+    // the cells' centroids. Snapping to the grid keeps them where they are from frame to frame.
+    static const float kEmissiveCellSize = 96.0f;
+
+    static void accumulateEmissiveCells(const DrawData &drawData, uint32_t indexStart, uint32_t triangleCount, const float radiance[3],
+        std::unordered_map<int64_t, RaytracingScene::EmissiveCell> &cells)
+    {
+        const uint32_t MaxTriangles = 512;
+        for (uint32_t t = 0; t < std::min(triangleCount, MaxTriangles); t++) {
+            float p[3][3];
+            bool valid = true;
+            for (uint32_t k = 0; (k < 3) && valid; k++) {
+                const uint32_t index = indexStart + t * 3 + k;
+                const interop::float4x4 *transform = nullptr;
+                valid = (index < drawData.faceIndices.size()) && scenePosition(drawData, drawData.faceIndices[index], p[k][0], p[k][1], p[k][2], transform);
+            }
+
+            if (!valid) {
+                continue;
+            }
+
+            const float e1[3] = { p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2] };
+            const float e2[3] = { p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2] };
+            float n[3] = { e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0] };
+            const float length = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+            if (!(length > 1e-6f) || !std::isfinite(length)) {
+                continue;
+            }
+
+            // Lava lies on the ground and lights upwards; a triangle's winding doesn't say which side is up.
+            const float sign = (n[1] < 0.0f) ? -1.0f : 1.0f;
+            const float area = length * 0.5f;
+            const float centroid[3] = { (p[0][0] + p[1][0] + p[2][0]) / 3.0f, (p[0][1] + p[1][1] + p[2][1]) / 3.0f, (p[0][2] + p[1][2] + p[2][2]) / 3.0f };
+            const int64_t cx = int64_t(std::floor(centroid[0] / kEmissiveCellSize)) & 0x1FFFFF;
+            const int64_t cy = int64_t(std::floor(centroid[1] / kEmissiveCellSize)) & 0x1FFFFF;
+            const int64_t cz = int64_t(std::floor(centroid[2] / kEmissiveCellSize)) & 0x1FFFFF;
+            RaytracingScene::EmissiveCell &cell = cells[(cx << 42) | (cy << 21) | cz];
+            for (int c = 0; c < 3; c++) {
+                cell.position[c] += centroid[c] * area;
+                cell.normal[c] += n[c] / length * sign * area;
+                cell.radiance[c] += radiance[c] * area;
+            }
+
+            cell.area += area;
+        }
+    }
+
     // Texture scrolling of a draw, followed across frames by its texture, vertex load and size: the game scrolls water by
     // moving the tile offset or by rewriting the vertex texture coordinates. A draw seen more than once in a frame (the
     // same mesh drawn twice) can't be told apart from scrolling, so it never counts.
@@ -1401,6 +1520,10 @@ namespace RT64 {
         hitGroupVector.clear();
         renderIndicesVector.clear();
         rtMaterialsVector.clear();
+        rtEmissionVector.clear();
+        rtAnyEmission = false;
+        rtFoliageVector.clear();
+        rtAnyFoliage = false;
         rspSmoothNormalVector.clear();
         frameParams.viewUbershaders = ubershadersVisible;
         frameParams.ditherNoiseStrength = ditherNoiseStrength;
@@ -3276,6 +3399,9 @@ namespace RT64 {
                 rtScene.decalsRasterAfter = 0;
                 rtScene.decalsFallback = 0;
                 rtScene.decalInfos.clear();
+                rtScene.emissiveDraws.clear();
+                rtScene.emissiveCells.clear();
+                rtScene.foliageDraws = 0;
 
                 return true;
             }
@@ -3419,6 +3545,8 @@ namespace RT64 {
                 renderIndices.highlightColor = call.debuggerDesc.highlightColor;
                 renderIndicesVector.push_back(renderIndices);
                 rtMaterialsVector.push_back(0);
+                rtEmissionVector.push_back(0);
+                rtFoliageVector.insert(rtFoliageVector.end(), 3, 0u);
 #           if RT_ENABLED
                 bool rtInstanceAdded = false;
                 RaytracingInstance rtInstance;
@@ -3578,6 +3706,21 @@ namespace RT64 {
                                 const uint64_t materialKey = drawData.callTiles[call.callDesc.tileIndex].tmemHashOrID;
                                 rtMaterialsVector.back() = materials.packedMaterial(materialKey);
 
+                                // Emissive materials (lava): their emission for the shaders, and their triangles for
+                                // the lights they cast.
+                                uint32_t packedEmission = 0;
+                                float emissionRadiance[3];
+                                if (materials.emissiveMaterial(materialKey, packedEmission, emissionRadiance)) {
+                                    rtEmissionVector.back() = packedEmission;
+                                    rtAnyEmission = true;
+                                    if (rtScene.emissiveDraws.size() < 64) {
+                                        rtScene.emissiveDraws.push_back({ materialKey, rtInstance.renderIndex, call.callDesc.triangleCount,
+                                            { emissionRadiance[0], emissionRadiance[1], emissionRadiance[2] } });
+                                    }
+
+                                    accumulateEmissiveCells(drawData, call.meshDesc.faceIndicesStart, call.callDesc.triangleCount, emissionRadiance, rtScene.emissiveCells);
+                                }
+
                                 // Advanced Water Rendering for water drawn as ordinary depth writing geometry (the sea by
                                 // Limelin): a texture listed with class water, or a large flat surface whose texture
                                 // scrolls. Blue tiled floors are just as flat and wide but stand still.
@@ -3674,6 +3817,37 @@ namespace RT64 {
                                 rtMaterialsVector.back() |= RtMaterialSceneryFlag;
                             }
 
+                            // Foliage: trees and bushes drawn as upright cutout planes (often two crossed planes),
+                            // without N64 lighting. They are shaded with one soft normal around the tree's axis instead of
+                            // per plane, with wrapped light, and don't shadow themselves, so a plane can't cast a hard
+                            // line across its crossing partner. rt_materials.json class "foliage" turns it on for a
+                            // texture; a user entry of another class (other than sprite or grass) turns it off.
+                            rtMaterialsVector.back() &= ~RtMaterialClassBits;
+                            bool foliageListedOther = false;
+                            if (alphaTested && !decalDraw) {
+                                const uint64_t foliageKey = (flags.usesTexture0 && (call.callDesc.tileCount > 0)) ? drawData.callTiles[call.callDesc.tileIndex].tmemHashOrID : 0;
+                                RtMaterialEntry foliageEntry;
+                                const bool hasEntry = (foliageKey != 0) && rtMaterialDatabase().find(foliageKey, foliageEntry) && foliageEntry.user;
+                                const bool listedFoliage = hasEntry && (foliageEntry.materialClass == RtMaterialClass::Foliage);
+                                const bool listedOther = hasEntry && !listedFoliage && (foliageEntry.materialClass != RtMaterialClass::Sprite) && (foliageEntry.materialClass != RtMaterialClass::Grass);
+                                foliageListedOther = listedOther;
+                                float horizontalCenter[2] = {};
+                                float radius = 0.0f;
+                                if (listedFoliage || (!listedOther && looksLikeFoliage(drawData, call.meshDesc.faceIndicesStart, call.callDesc.triangleCount))) {
+                                    rtMaterialsVector.back() |= RtMaterialFoliageFlag;
+                                    foliageBounds(drawData, call.meshDesc.faceIndicesStart, call.callDesc.triangleCount * 3, horizontalCenter, radius);
+                                    rtAnyFoliage = true;
+                                    rtScene.foliageDraws++;
+                                }
+
+                                const size_t base = size_t(rtInstance.renderIndex) * 3;
+                                if (rtFoliageVector.size() >= (base + 3)) {
+                                    rtFoliageVector[base + 0] = floatBits(horizontalCenter[0]);
+                                    rtFoliageVector[base + 1] = floatBits(horizontalCenter[1]);
+                                    rtFoliageVector[base + 2] = floatBits(radius);
+                                }
+                            }
+
                             if (decalDraw) {
                                 rtMaterialsVector.back() |= RtMaterialDecalFlag | (interop::Blender::usesAlphaBlend(otherMode) ? RtMaterialDecalBlendFlag : 0u);
                                 // A learned offset from the surface rides in the metalness byte, which a decal without
@@ -3724,6 +3898,28 @@ namespace RT64 {
                                         rtInstance.queryMask = RtCameraRayMask;
                                         rtProxyAdded = true;
                                         rtScene.billboardProxies++;
+                                    }
+                                }
+                            }
+
+                            // Camera facing billboards (the trees of the towns and fields) are foliage too, though the
+                            // game lights them with vertex normals: their proxies don't shadow them (see ShadowAnyHit),
+                            // and they take one soft normal facing the viewer (radius -1 in the foliage words), the same
+                            // for every draw of a tree, as a tree is often split into a left and a right draw.
+                            if (rtProxyAdded) {
+                                rtMaterialsVector.back() |= RtMaterialBillboardFlag;
+                                if (!foliageListedOther) {
+                                    if ((rtMaterialsVector.back() & RtMaterialFoliageFlag) == 0) {
+                                        rtMaterialsVector.back() |= RtMaterialFoliageFlag;
+                                        rtAnyFoliage = true;
+                                        rtScene.foliageDraws++;
+                                    }
+
+                                    const size_t base = size_t(rtInstance.renderIndex) * 3;
+                                    if (rtFoliageVector.size() >= (base + 3)) {
+                                        rtFoliageVector[base + 0] = 0;
+                                        rtFoliageVector[base + 1] = 0;
+                                        rtFoliageVector[base + 2] = floatBits(-1.0f);
                                     }
                                 }
                             }
@@ -4290,9 +4486,31 @@ namespace RT64 {
 
     void FramebufferRenderer::endFramebuffers(RenderWorker *worker, const DrawBuffers *drawBuffers, const OutputBuffers *outputBuffers, bool rtEnabled) {
         bool shaderViewRtEnabled = false;
+        // The draws' emission words follow their material words in gRtMaterials, only when some draw is emissive.
+        // Then the foliage centers (three words per draw), only when some draw is foliage.
+        rtMaterialsUpload = rtMaterialsVector;
+        uint32_t emissionOffset = 0;
+        uint32_t foliageOffset = 0;
+        if (rtAnyEmission && (rtEmissionVector.size() == rtMaterialsVector.size())) {
+            emissionOffset = uint32_t(rtMaterialsUpload.size());
+            rtMaterialsUpload.insert(rtMaterialsUpload.end(), rtEmissionVector.begin(), rtEmissionVector.end());
+        }
+
+        if (rtAnyFoliage && (rtFoliageVector.size() == (rtMaterialsVector.size() * 3))) {
+            foliageOffset = uint32_t(rtMaterialsUpload.size());
+            rtMaterialsUpload.insert(rtMaterialsUpload.end(), rtFoliageVector.begin(), rtFoliageVector.end());
+        }
+
+#   if RT_ENABLED
+        if (rtResources != nullptr) {
+            rtResources->rtParams.emissionOffset = emissionOffset;
+            rtResources->rtParams.foliageOffset = foliageOffset;
+        }
+#   endif
+
         std::vector<BufferUploader::Upload> shaderUploads = {
             { renderIndicesVector.data(), { 0, renderIndicesVector.size() }, sizeof(interop::RenderIndices), RenderBufferFlag::STORAGE, { }, &renderIndicesBuffer},
-            { rtMaterialsVector.data(), { 0, rtMaterialsVector.size() }, sizeof(uint32_t), RenderBufferFlag::STORAGE, { }, &rtMaterialsBuffer},
+            { rtMaterialsUpload.data(), { 0, rtMaterialsUpload.size() }, sizeof(uint32_t), RenderBufferFlag::STORAGE, { }, &rtMaterialsBuffer},
             { &frameParams, { 0, 1 }, sizeof(interop::FrameParams), RenderBufferFlag::CONSTANT, { }, &frameParamsBuffer}
         };
 

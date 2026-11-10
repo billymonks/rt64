@@ -82,6 +82,15 @@ namespace RT64 {
         // Ray traced surface material of each render index (see RtMaterialDatabase), kept out of RenderIndices because
         // the raster shaders share that struct's layout.
         std::vector<uint32_t> rtMaterialsVector;
+        // Emission of each draw (RtMaterialDatabase::emissiveMaterial), uploaded after the materials into the same buffer
+        // when any draw of the frame is emissive (RaytracingParams::emissionOffset).
+        std::vector<uint32_t> rtEmissionVector;
+        std::vector<uint32_t> rtMaterialsUpload;
+        bool rtAnyEmission = false;
+        // Foliage center (X, Z) and radius of each draw as float bits, after the emission words
+        // (RaytracingParams::foliageOffset).
+        std::vector<uint32_t> rtFoliageVector;
+        bool rtAnyFoliage = false;
         std::vector<DynamicTextureView> dynamicTextureViewVector;
         std::vector<RenderTextureBarrier> dynamicTextureBarrierVector;
         std::unique_ptr<BufferUploader> shaderUploader;

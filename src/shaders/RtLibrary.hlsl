@@ -119,6 +119,8 @@ struct ShadowPayload {
     // Render index of the surface being lit. Its own draw does not shadow it: the light facing proxy of a billboard
     // would otherwise cut through the sprite it stands in for.
     float selfRenderIndex;
+    // 1 when the surface is a camera facing billboard: proxies near it don't shadow it (see kBillboardProxyReach).
+    float selfBillboard;
 };
 
 // Instance masks, see RtCameraRayMask and RtShadowRayMask. Camera and bounce rays see the drawn geometry; shadow
@@ -219,6 +221,97 @@ static const uint kDecalStatBehind = 5;
 static const uint kDecalStatInFront = 6;
 static const uint kDecalStatMinDistance = 7;
 static const uint kDecalStatHistogram = 8;
+
+// The center pixel's emission (see surfaceEmission): whether it's emissive, then the emitted color as float bits.
+static const uint kDiagEmissiveCenter = 200;
+// Pixels whose surface is emissive, this frame.
+static const uint kDiagEmissivePixels = 204;
+// Marks an emissive pixel in gRefraction's alpha for the upscaler's reactive mask (UpscalerInputsCS), without visibly
+// changing the composed color: animated lava has no motion vectors for its texture.
+static const float kEmissiveReactiveCoverage = 0.004;
+
+// Light an emissive material (rt_materials.json "emission", lava) gives off at a surface of this albedo: its emission
+// color (or the albedo itself) times its strength. Zero for every draw when no draw of the frame is emissive.
+float3 surfaceEmission(uint renderIndex, float3 albedo) {
+    if (RtParams.emissionOffset == 0) {
+        return 0.0;
+    }
+
+    const uint packed = gRtMaterials[RtParams.emissionOffset + renderIndex];
+    const float strength = float(packed >> 24) / 32.0;
+    const uint colorBits = packed & 0xFFFFFF;
+    const float3 color = (colorBits != 0) ? (float3(colorBits & 0xFF, (colorBits >> 8) & 0xFF, (colorBits >> 16) & 0xFF) / 255.0) : albedo;
+    return color * strength;
+}
+
+// Foliage (see RtMaterialFoliageFlag): trees and bushes drawn as upright cutout planes, often two crossed planes.
+// Their normal is a soft one around the tree's vertical axis, as if the tree were a round volume: away from the axis
+// sideways, towards the viewer in the middle and a little upwards. Every plane of a tree then shades as one smooth
+// gradient instead of each plane by its own facing. Light wraps around them (kFoliageWrap), their side away from the
+// light still passes some of it (kFoliageTransmission), and a tree doesn't shadow itself.
+static const uint kMaterialFoliageFlag = 1u << 26;
+// A camera facing billboard with a light facing shadow proxy (see RtMaterialBillboardFlag). Shadow rays from it skip the
+// proxies within kBillboardProxyReach: its own, and those of the other draws of the same tree. A proxy turned to the
+// light crosses the camera facing sprite along a vertical line, and the half behind it would be shadowed by its own
+// tree, a line that moves as the billboard turns.
+static const uint kMaterialBillboardFlag = 1u << 25;
+static const float kBillboardProxyReach = 48.0;
+// The center pixel's vertex shade (float bits), and shadow ray hits on nearby proxies skipped for billboards this frame.
+static const uint kDiagCenterShade = 210;
+static const uint kDiagBillboardProxySkips = 214;
+static const float kFoliageWrap = 0.5;
+static const float kFoliageTransmission = 0.6;
+static const float kFoliageUp = 0.4;
+// The center pixel: whether it's foliage, then the soft normal used (float bits); and the foliage pixels this frame.
+static const uint kDiagFoliageCenter = 205;
+static const uint kDiagFoliagePixels = 209;
+
+bool isFoliage(float renderIndex) {
+    return (renderIndex >= 0.0) && ((gRtMaterials[uint(renderIndex)] & kMaterialFoliageFlag) != 0);
+}
+
+// The soft normal of a foliage hit at position, facing the ray. The tree's axis comes from the draw's center
+// (RtParams.foliageOffset), or for draws spread wider than a tree, the center of the triangle's own bounds.
+float3 foliageNormal(uint renderIndex, float3 position, float3 rayDirection, float3 p0, float3 p1, float3 p2) {
+    float2 center = float2(0.0, 0.0);
+    float radius = 0.0;
+    if (RtParams.foliageOffset != 0) {
+        const uint base = RtParams.foliageOffset + renderIndex * 3;
+        center = float2(asfloat(gRtMaterials[base + 0]), asfloat(gRtMaterials[base + 1]));
+        radius = asfloat(gRtMaterials[base + 2]);
+    }
+
+    // Camera facing billboards (radius -1) face the viewer as a whole: the same normal on every draw of a tree, which
+    // may be split into a left and a right draw with centers of their own.
+    if (radius < 0.0) {
+        center = position.xz;
+        radius = 1.0;
+    }
+    else if (!(radius > 0.0)) {
+        const float2 minXZ = min(p0.xz, min(p1.xz, p2.xz));
+        const float2 maxXZ = max(p0.xz, max(p1.xz, p2.xz));
+        center = (minXZ + maxXZ) * 0.5;
+        radius = max(max(maxXZ.x - minXZ.x, maxXZ.y - minXZ.y) * 0.5, 1.0);
+    }
+
+    float2 radial = (position.xz - center) / radius;
+    const float radialLength = length(radial);
+    if (radialLength > 1.0) {
+        radial /= radialLength;
+    }
+
+    const float2 toViewer = -rayDirection.xz;
+    const float toViewerLength = length(toViewer);
+    const float2 viewerSide = (toViewerLength > 1e-4) ? (toViewer / toViewerLength) : float2(0.0, 0.0);
+    const float depth = sqrt(saturate(1.0 - dot(radial, radial)));
+    float3 normal = normalize(float3(radial.x + viewerSide.x * depth, kFoliageUp, radial.y + viewerSide.y * depth));
+    // Facing the ray, like every other normal: a ray from above or below still sees the near side.
+    if (dot(normal, rayDirection) > -0.1) {
+        normal = normalize(normal - rayDirection * (dot(normal, rayDirection) + 0.1));
+    }
+
+    return normal;
+}
 
 int diagDecalSlot(uint renderIndex) {
     const uint id = renderIndex + 1;
@@ -341,6 +434,8 @@ struct Material {
     float3 fogColor;
     float fogFactor;
     bool visible;
+    // The N64 vertex shade the combiner used (the game's own lighting of lit vertices), for the F9 capture.
+    float3 shade;
 };
 
 // The raster pixel shader's material path (RasterPS / ShadowCutoutPS) for one ray hit. There are no screen space
@@ -441,6 +536,7 @@ Material evalMaterial(uint renderIndex, uint primitiveIndex, float2 barycentrics
     Material material;
     material.color = float4(Blender::run(otherMode, rp.flags, blInputs, combinerColor, true).rgb, combinerColor.a);
     material.visible = true;
+    material.shade = shadeColor.rgb;
     if ((otherMode.alphaCompare() == G_AC_THRESHOLD) && (alphaCompareValue < rdp.blendColor.a)) {
         material.visible = false;
     }
@@ -603,8 +699,20 @@ void SurfaceAnyHit(inout HitPayload payload, in BuiltInTriangleIntersectionAttri
 
 [shader("anyhit")]
 void ShadowAnyHit(inout ShadowPayload payload, in BuiltInTriangleIntersectionAttributes attr) {
-    // A billboard proxy never shadows the sprite it stands in for.
-    if (((InstanceID() & kInstanceProxyBit) != 0) && (float(hitRenderIndex()) == payload.selfRenderIndex)) {
+    // A billboard proxy never shadows the sprite it stands in for, and a tree (foliage) never shadows itself: its crossed
+    // planes would cut a hard line across each other.
+    if ((float(hitRenderIndex()) == payload.selfRenderIndex) &&
+        (((InstanceID() & kInstanceProxyBit) != 0) || ((gRtMaterials[hitRenderIndex()] & kMaterialFoliageFlag) != 0)))
+    {
+        IgnoreHit();
+    }
+
+    // A billboard isn't shadowed by the proxies right next to it: its own tree's, whichever draw of the tree they
+    // belong to. Proxies further away (other trees) still shadow it.
+    if ((payload.selfBillboard > 0.5) && ((InstanceID() & kInstanceProxyBit) != 0) && (RayTCurrent() < kBillboardProxyReach)) {
+        if (diagFrame()) {
+            InterlockedAdd(gHitInstanceId[kDiagBillboardProxySkips], 1);
+        }
         IgnoreHit();
     }
 
@@ -677,9 +785,22 @@ void shadeSurface(uint renderIndex, uint primitiveIndex, float2 barycentrics, fl
         geometricNormal = shadingNormal;
     }
 
+    // Foliage takes one soft normal for both, so its crossed planes shade as a single round shape.
+    if ((gRtMaterials[renderIndex] & kMaterialFoliageFlag) != 0) {
+        shadingNormal = foliageNormal(renderIndex, rayOrigin + rayDirection * hitT, rayDirection, p0, p1, p2);
+        geometricNormal = shadingNormal;
+    }
+
     // Grazing angles stretch the cone footprint across the surface.
     const float footprint = coneWidth / max(abs(dot(geometricNormal, rayDirection)), 0.2);
     Material material = evalMaterial(renderIndex, primitiveIndex, barycentrics, footprint);
+    // The center pixel's vertex shade (camera rays arrive with payload.hit = 2), for the F9 capture.
+    if ((payload.hit > 1.5) && (payload.hit < 2.5) && diagFrame() && isDiagPixel(DispatchRaysIndex().xy)) {
+        gHitInstanceId[kDiagCenterShade + 0] = asuint(material.shade.r);
+        gHitInstanceId[kDiagCenterShade + 1] = asuint(material.shade.g);
+        gHitInstanceId[kDiagCenterShade + 2] = asuint(material.shade.b);
+        gHitInstanceId[kDiagCenterShade + 3] = renderIndex;
+    }
     const float3 velocity = loadVelocity(i0) * w0 + loadVelocity(i1) * barycentrics.x + loadVelocity(i2) * barycentrics.y;
     payload.px = velocity.x;
     payload.py = velocity.y;
@@ -767,6 +888,7 @@ float traceShadow(float3 origin, float3 direction, float distance, float selfRen
     ShadowPayload payload;
     payload.shadowed = 0.0;
     payload.selfRenderIndex = selfRenderIndex;
+    payload.selfBillboard = ((selfRenderIndex >= 0.0) && ((gRtMaterials[uint(selfRenderIndex)] & kMaterialBillboardFlag) != 0)) ? 1.0 : 0.0;
     TraceRay(SceneBVH, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, kShadowRayMask, 1, 0, 1, ray, payload);
     return payload.shadowed;
 }
@@ -846,6 +968,8 @@ LightSample sampleLight(float3 position, float3 normal, float3 geometricNormal, 
         return result;
     }
 
+    const bool foliage = (RtParams.foliageOffset != 0) && isFoliage(selfRenderIndex);
+
     // The room has the sun and moon switched off (rt_lights.json "room settings"): everything gets the level of a
     // surface that neither faces nor sees the light, and no shadow ray is traced. Manual and emissive lights add on top.
     if (RtParams.sunDisabled != 0) {
@@ -883,8 +1007,12 @@ LightSample sampleLight(float3 position, float3 normal, float3 geometricNormal, 
         const float3 shadowDirection = sampleCone(result.direction, kSunAngularRadius, noise);
         const float bias = surfaceBias(hitT);
         result.visibility = facingGate * (1.0 - traceShadow(shadowRayOrigin(position, geometricNormal, normal, shadowDirection, bias, twoSided), shadowDirection, result.distance, selfRenderIndex));
-        // The back of a two-sided surface (a cape, leaves) only lets part of the light through.
-        if (twoSided && (geometricFacing < 0.0)) {
+        // The back of a two-sided surface (a cape, leaves) only lets part of the light through. Foliage fades to its
+        // transmission smoothly across the side turned from the light, with no line where its soft normal turns away.
+        if (foliage) {
+            result.visibility *= lerp(kFoliageTransmission, 1.0, saturate(1.0 + geometricFacing * 2.0));
+        }
+        else if (twoSided && (geometricFacing < 0.0)) {
             result.visibility *= kBackTranslucency;
         }
     }
@@ -898,7 +1026,9 @@ LightSample sampleLight(float3 position, float3 normal, float3 geometricNormal, 
     float3 lightTint = lerp(float3(1.0, 1.0, 1.0), light.diffuseColor / maxColor, kLightColorTint);
     // Two-sided surfaces brighten with the angle on either side; solid ones only on the side facing the light, so
     // the varying smooth normals of a wall's shadow side don't show as patches.
-    const float facing = twoSided ? saturate(abs(result.ndotl)) : (saturate(result.ndotl) * smoothstep(-kSunFaceFade, 0.0, geometricFacing));
+    // Foliage wraps the light around its soft normal, so its shaded side keeps some of it.
+    const float facing = foliage ? saturate((result.ndotl + kFoliageWrap) / (1.0 + kFoliageWrap)) :
+        (twoSided ? saturate(abs(result.ndotl)) : (saturate(result.ndotl) * smoothstep(-kSunFaceFade, 0.0, geometricFacing)));
     result.factor = lerp(facingFloor.xxx, float3(1.0, 1.0, 1.0), facing) * lerp(shadowTint, float3(1.0, 1.0, 1.0), result.visibility);
     result.factor *= lerp(float3(1.0, 1.0, 1.0), lightTint, result.visibility);
     return result;
@@ -1454,6 +1584,14 @@ void PrimaryRayGen() {
         diagCount(kDiagTieBreaks, tieBreakChanged);
         diagCount(kDiagDecalHits, decalApplied);
         diagCount(kDiagDecalBlends, decalBlended);
+        const bool foliageHit = (payload.hit > 0.5) && (RtParams.foliageOffset != 0) && isFoliage(payload.renderIndex);
+        diagCount(kDiagFoliagePixels, foliageHit);
+        if (isDiagPixel(pix)) {
+            gHitInstanceId[kDiagFoliageCenter + 0] = foliageHit ? 1u : 0u;
+            gHitInstanceId[kDiagFoliageCenter + 1] = asuint(payload.nx);
+            gHitInstanceId[kDiagFoliageCenter + 2] = asuint(payload.ny);
+            gHitInstanceId[kDiagFoliageCenter + 3] = asuint(payload.nz);
+        }
     }
     if (isDiagPixel(pix)) {
         writeDiagnostics(origin, direction, payload);
@@ -1694,7 +1832,8 @@ void IndirectRayGen() {
         // Emissive lights at the bounce point, without shadow rays to keep the bounce cheap.
         const float3 bounceEmissive = sampleEmissive(bouncePos, bounceNormal, bounceGeometricNormal, hitT + bounce.hitT, false, pixelNoise(pix, 3));
         const float3 albedo1 = float3(bounce.ar, bounce.ag, bounce.ab);
-        bounceLight = albedo1 * (bounceSample.factor + bounceEmissive);
+        // An emissive surface (lava) the bounce ray hits gives off its own light too.
+        bounceLight = albedo1 * (bounceSample.factor + bounceEmissive) + surfaceEmission(uint(bounce.renderIndex), albedo1);
 
         // Second bounce (Graphics menu "Second light bounce"): one more cosine weighted ray from the bounce point. With
         // cosine sampling the estimate is just the light coming back along the ray, times this surface's albedo. Only
@@ -1721,7 +1860,8 @@ void IndirectRayGen() {
                 LightSample secondSample = sampleLight(secondPos, secondHitNormal, secondHitGeometric, secondHitT, second.renderIndex, hitTwoSided(second.hit), pixelNoise(pix, 4));
                 const float3 secondEmissive = sampleEmissive(secondPos, secondHitNormal, secondHitGeometric, secondHitT, false, pixelNoise(pix, 5));
                 const float3 shadowFloor = RtParams.cameraW.w * RtParams.cameraW.xyz;
-                secondIncoming = float3(second.ar, second.ag, second.ab) * (max(secondSample.factor - shadowFloor, 0.0) + secondEmissive);
+                const float3 albedo2 = float3(second.ar, second.ag, second.ab);
+                secondIncoming = albedo2 * (max(secondSample.factor - shadowFloor, 0.0) + secondEmissive) + surfaceEmission(uint(second.renderIndex), albedo2);
             }
             else {
                 secondIncoming = skyLight;
@@ -1849,6 +1989,20 @@ void ReflectionRayGen() {
     }
 
     const uint renderIndex = uint(gInstanceId[pix]);
+    // Emissive materials (lava) glow on top of their lighting, like the specular light: shadows and ambient occlusion
+    // don't touch it, and ComposePS keeps the sum in display range.
+    const float3 emission = surfaceEmission(renderIndex, gDiffuse[pix].rgb);
+    gReflection[pix] = float4(emission, 1.0);
+    if (isDiagPixel(pix) && diagFrame()) {
+        gHitInstanceId[kDiagEmissiveCenter + 0] = any(emission > 0.0) ? 1u : 0u;
+        gHitInstanceId[kDiagEmissiveCenter + 1] = asuint(emission.r);
+        gHitInstanceId[kDiagEmissiveCenter + 2] = asuint(emission.g);
+        gHitInstanceId[kDiagEmissiveCenter + 3] = asuint(emission.b);
+    }
+    if (diagFrame() && (RtParams.emissionOffset != 0)) {
+        diagCount(kDiagEmissivePixels, any(emission > 0.0));
+    }
+
     const SurfaceSpecular surface = unpackSurfaceSpecular(gRtMaterials[renderIndex]);
     // Water surfaces get their reflection and glint from the water pass (RefractionRayGen).
     if ((surface.strength <= 0.0) || ((RtParams.waterDraws != 0) && ((gRtMaterials[renderIndex] & kMaterialWaterPassFlag) != 0))) {
@@ -1918,7 +2072,7 @@ void ReflectionRayGen() {
             const float3 reflectedNormal = float3(reflected.nx, reflected.ny, reflected.nz);
             const float3 reflectedGeometricNormal = float3(reflected.gx, reflected.gy, reflected.gz);
             const LightSample reflectedSample = sampleLight(reflectedPosition, reflectedNormal, reflectedGeometricNormal, hitT + reflected.hitT, reflected.renderIndex, hitTwoSided(reflected.hit), float2(0.0, 0.0));
-            reflectedLight = float3(reflected.ar, reflected.ag, reflected.ab) * reflectedSample.factor;
+            reflectedLight = float3(reflected.ar, reflected.ag, reflected.ab) * reflectedSample.factor + surfaceEmission(uint(reflected.renderIndex), float3(reflected.ar, reflected.ag, reflected.ab));
             reflectedLight = lerp(reflectedLight, float3(reflected.fr, reflected.fg, reflected.fb), saturate(reflected.fogFactor));
         }
         else {
@@ -1933,7 +2087,7 @@ void ReflectionRayGen() {
     // Light that leaves as specular doesn't also leave as diffuse. Metals keep part of their texture as diffuse, since
     // the N64 textures already paint their look.
     const float diffuseScale = (1.0 - weight * dot(reflectionFresnel, float3(0.299, 0.587, 0.114)) * glossy) * (1.0 - kMetalDiffuseLoss * surface.metalness * weight);
-    gReflection[pix] = float4(min(specular, kSpecularMaxRadiance), saturate(diffuseScale));
+    gReflection[pix] = float4(min(specular, kSpecularMaxRadiance) + emission, saturate(diffuseScale));
     if (isDiagPixel(pix)) {
         gHitColor[8] = gReflection[pix];
     }
@@ -2036,6 +2190,13 @@ void RefractionRayGen() {
     }
 
     gRefraction[pix] = 0.0;
+    // Emissive surfaces (lava, often an animated texture) are marked for the upscaler's reactive mask.
+    if ((RtParams.emissionOffset != 0) && (RtParams.debugView == 0) && (gDiffuse[pix].a > EPSILON) &&
+        any(surfaceEmission(uint(gInstanceId[pix]), gDiffuse[pix].rgb) > 0.0))
+    {
+        gRefraction[pix] = float4(0.0, 0.0, 0.0, kEmissiveReactiveCoverage);
+    }
+
     if ((RtParams.waterDraws == 0) || kHybridLighting || (RtParams.debugView != 0)) {
         return;
     }
@@ -2154,7 +2315,7 @@ void RefractionRayGen() {
         const float3 reflectedNormal = float3(reflected.nx, reflected.ny, reflected.nz);
         const float3 reflectedGeometricNormal = float3(reflected.gx, reflected.gy, reflected.gz);
         const LightSample reflectedSample = sampleLight(reflectedPosition, reflectedNormal, reflectedGeometricNormal, waterT + reflected.hitT, reflected.renderIndex, hitTwoSided(reflected.hit), float2(0.0, 0.0));
-        reflectedLight = float3(reflected.ar, reflected.ag, reflected.ab) * reflectedSample.factor;
+        reflectedLight = float3(reflected.ar, reflected.ag, reflected.ab) * reflectedSample.factor + surfaceEmission(uint(reflected.renderIndex), float3(reflected.ar, reflected.ag, reflected.ab));
         reflectedLight = lerp(reflectedLight, float3(reflected.fr, reflected.fg, reflected.fb), saturate(reflected.fogFactor));
     }
     else {

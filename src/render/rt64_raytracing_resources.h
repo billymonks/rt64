@@ -71,6 +71,13 @@ namespace RT64 {
     // Large path traced draws (scenery rather than characters or small objects), which take decals drawn before them.
     // It replaces the top bit of the material class, which the shaders don't read.
     static const uint32_t RtMaterialSceneryFlag = 1u << 27;
+    // Foliage (upright cutout trees and bushes, see looksLikeFoliage): a soft normal around the tree's axis, wrapped
+    // light and no self-shadowing. The rest of the material class bits are cleared; the shaders don't read the class.
+    static const uint32_t RtMaterialFoliageFlag = 1u << 26;
+    static const uint32_t RtMaterialClassBits = 0x07000000u;
+    // A camera facing billboard with a light facing shadow proxy: proxies close to it don't shadow it (its own, and
+    // the other draws of a tree split into several).
+    static const uint32_t RtMaterialBillboardFlag = 1u << 25;
     // Largest learned offset of a decal from its surface (kDecalMaxOffset in RtLibrary.hlsl).
     static const float RtDecalMaxOffset = 16.0f;
 
@@ -176,6 +183,24 @@ namespace RT64 {
             float envAlpha;
         };
         std::vector<DecalInfo> decalInfos;
+        // Path traced draws with an emissive material (lava), for the F9 log, and their triangles gathered into cells
+        // of a world grid (sums weighted by area), from which the lava lights are placed.
+        struct EmissiveDraw {
+            uint64_t key;
+            uint32_t renderIndex;
+            uint32_t triangles;
+            float radiance[3];
+        };
+        std::vector<EmissiveDraw> emissiveDraws;
+        struct EmissiveCell {
+            float position[3] = {};
+            float normal[3] = {};
+            float radiance[3] = {};
+            float area = 0.0f;
+        };
+        std::unordered_map<int64_t, EmissiveCell> emissiveCells;
+        // Path traced draws shaded as foliage.
+        uint32_t foliageDraws = 0;
         uint32_t billboardsCylindrical = 0;
         uint32_t billboardsSpherical = 0;
         uint32_t billboardProxies = 0;
@@ -454,7 +479,47 @@ namespace RT64 {
         // (which indexes its smoothed color on the GPU) and its position can be smoothed.
         static const uint32_t MaxEmissiveLights = 32;
         // Manual point lights (rt_lights.json) used per area, on top of the emissive lights.
-        static const uint32_t MaxManualLights = 16;
+        // Manual lights (rt_lights.json) shown at once: the area's most important lights for the camera this frame (see
+        // updateEmissiveLights). An area may have up to MaxAreaManualLights.
+        static const uint32_t MaxManualLights = 24;
+        static const uint32_t MaxAreaManualLights = 1024;
+        // How long a light takes to fade in or out as it joins or leaves the shown set, how much a shown light's rank is
+        // raised so close calls don't trade places, and how far beyond its reach a light may be and still count.
+        static constexpr float ManualLightFadeSeconds = 0.4f;
+        static constexpr float ManualLightHysteresis = 1.25f;
+        static constexpr float ManualLightViewReach = 600.0f;
+        struct ManualLightState {
+            float fade = 0.0f;
+            float distance = 0.0f;
+            float score = 0.0f;
+            bool selected = false;
+            bool seen = false;
+        };
+        std::unordered_map<std::string, ManualLightState> manualLightFades;
+        float manualLightsLastSeconds = 0.0f;
+        uint32_t frameAreaManualLights = 0;
+        struct ManualLightInfo {
+            std::string id;
+            float distance;
+            float fade;
+            float score;
+            bool selected;
+        };
+        std::vector<ManualLightInfo> frameManualLights;
+        // Lights cast by emissive materials (lava): one per cell of emissive triangles nearest the camera, fading in and
+        // out as cells enter and leave that set. Separate from the effect and manual lights.
+        static const uint32_t MaxLavaLights = 12;
+        struct LavaLight {
+            int64_t cell = 0;
+            float position[3] = {};
+            float radiance[3] = {};
+            float range = 0.0f;
+            float radius = 0.0f;
+            float fade = 0.0f;
+            bool selected = false;
+        };
+        std::vector<LavaLight> lavaLights;
+        uint32_t frameLavaLightCount = 0;
         std::vector<std::string> frameManualLightIds;
         // The room's sun and moon setting (rt_lights.json "room settings") last frame and where it came from.
         int32_t lastSunDisabled = -1;
