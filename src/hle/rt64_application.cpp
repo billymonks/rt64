@@ -11,6 +11,10 @@
 #include "common/rt64_elapsed_timer.h"
 #include "common/rt64_math.h"
 
+#if defined(_WIN64)
+#   include "common/rt64_sommelier.h"
+#endif
+
 #if RT_ENABLED
 #   include <cstdint>
 #   include <vector>
@@ -30,7 +34,25 @@ namespace plume {
 }
 
 namespace RT64 {
+    // Defined in rt64_raytracing_resources.cpp.
+    void rtDiagLog(const char *fmt, ...);
+
     // Constants
+
+    static const char *graphicsAPIName(UserConfiguration::GraphicsAPI graphicsAPI) {
+        switch (graphicsAPI) {
+        case UserConfiguration::GraphicsAPI::D3D12:
+            return "D3D12";
+        case UserConfiguration::GraphicsAPI::Vulkan:
+            return "Vulkan";
+        case UserConfiguration::GraphicsAPI::Metal:
+            return "Metal";
+        case UserConfiguration::GraphicsAPI::Automatic:
+            return "Automatic";
+        default:
+            return "Unknown";
+        }
+    }
 
     static std::unique_ptr<RenderInterface> CreateVulkanInterfaceWrapper(RenderWindow renderWindow) {
 #ifdef RT64_SDL_WINDOW_VULKAN
@@ -130,53 +152,91 @@ namespace RT64 {
         appWindow->detectRefreshRate();
 
         // Resolve the graphics API option in case it's automatic.
+        const bool automaticGraphicsAPIRequested = (userConfig.graphicsAPI == UserConfiguration::GraphicsAPI::Automatic);
         chosenGraphicsAPI = UserConfiguration::resolveGraphicsAPI(userConfig.graphicsAPI);
-
-        // Create a render interface with the preferred backend.
-        switch (chosenGraphicsAPI) {
-        case UserConfiguration::GraphicsAPI::D3D12:
-#       ifdef _WIN64
-            renderInterface = CreateD3D12Interface();
-            break;
-#       else
-            fprintf(stderr, "D3D12 is not supported on this platform. Please select a different Graphics API.\n");
-            return SetupResult::InvalidGraphicsAPI;
-#       endif
-        case UserConfiguration::GraphicsAPI::Metal:
-#       ifdef __APPLE__
-            renderInterface = CreateMetalInterface();
-            break;
-#       else
-            fprintf(stderr, "Metal is not supported on this platform. Please select a different Graphics API.\n");
-            return SetupResult::InvalidGraphicsAPI;
-#       endif
-        case UserConfiguration::GraphicsAPI::Vulkan:
-            renderInterface = CreateVulkanInterfaceWrapper(appWindow->windowHandle);
-            break;
-        default:
-            fprintf(stderr, "Unknown Graphics API specified in configuration.\n");
-            return SetupResult::InvalidGraphicsAPI;
+        const char *graphicsAPIReason = automaticGraphicsAPIRequested ? "Automatic" : "set in the configuration";
+#   ifdef _WIN64
+        const bool runningUnderWine = Sommelier::detectWine();
+        if (automaticGraphicsAPIRequested && runningUnderWine) {
+            graphicsAPIReason = "Automatic, Wine/Proton detected";
         }
 
-        if (renderInterface == nullptr) {
-            fprintf(stderr, "Unable to initialize graphics API.\n");
-            return SetupResult::GraphicsAPINotFound;
+        // The path tracer is only known to work on D3D12 in Windows builds, so Automatic picks D3D12 when it's on, even under
+        // Wine/Proton (vkd3d-proton) where it would otherwise pick Vulkan.
+        const bool pathTracingPrefersD3D12 = automaticGraphicsAPIRequested && userConfig.advancedLighting;
+        if (pathTracingPrefersD3D12) {
+            chosenGraphicsAPI = UserConfiguration::GraphicsAPI::D3D12;
+            graphicsAPIReason = runningUnderWine ? "Automatic, path tracing on, Wine/Proton detected" : "Automatic, path tracing on";
+        }
+#   else
+        const bool pathTracingPrefersD3D12 = false;
+#   endif
+
+        // Create a render interface and device with the chosen backend.
+        auto createRenderDevice = [&]() {
+            switch (chosenGraphicsAPI) {
+            case UserConfiguration::GraphicsAPI::D3D12:
+#           ifdef _WIN64
+                renderInterface = CreateD3D12Interface();
+                break;
+#           else
+                fprintf(stderr, "D3D12 is not supported on this platform. Please select a different Graphics API.\n");
+                return SetupResult::InvalidGraphicsAPI;
+#           endif
+            case UserConfiguration::GraphicsAPI::Metal:
+#           ifdef __APPLE__
+                renderInterface = CreateMetalInterface();
+                break;
+#           else
+                fprintf(stderr, "Metal is not supported on this platform. Please select a different Graphics API.\n");
+                return SetupResult::InvalidGraphicsAPI;
+#           endif
+            case UserConfiguration::GraphicsAPI::Vulkan:
+                renderInterface = CreateVulkanInterfaceWrapper(appWindow->windowHandle);
+                break;
+            default:
+                fprintf(stderr, "Unknown Graphics API specified in configuration.\n");
+                return SetupResult::InvalidGraphicsAPI;
+            }
+
+            if (renderInterface == nullptr) {
+                fprintf(stderr, "Unable to initialize graphics API.\n");
+                return SetupResult::GraphicsAPINotFound;
+            }
+
+            device = renderInterface->createDevice();
+            if (device == nullptr) {
+                fprintf(stderr, "Unable to find compatible graphics device.\n");
+                return SetupResult::GraphicsDeviceNotFound;
+            }
+
+            return SetupResult::Success;
+        };
+
+        SetupResult deviceResult = createRenderDevice();
+        if ((deviceResult != SetupResult::Success) && pathTracingPrefersD3D12) {
+            const UserConfiguration::GraphicsAPI fallbackGraphicsAPI = UserConfiguration::resolveGraphicsAPI(UserConfiguration::GraphicsAPI::Automatic);
+            if (fallbackGraphicsAPI != chosenGraphicsAPI) {
+                fprintf(stderr, "D3D12 couldn't be set up for path tracing. Falling back to the automatic graphics API.\n");
+                device.reset();
+                renderInterface.reset();
+                chosenGraphicsAPI = fallbackGraphicsAPI;
+                graphicsAPIReason = "Automatic, path tracing on but D3D12 failed to start";
+                deviceResult = createRenderDevice();
+            }
         }
 
-        // Create the render device
-        device = renderInterface->createDevice();
-        if (device == nullptr) {
-            fprintf(stderr, "Unable to find compatible graphics device.\n");
-            return SetupResult::GraphicsDeviceNotFound;
+        if (deviceResult != SetupResult::Success) {
+            return deviceResult;
         }
 
         // Detect if the application should use hardware resolve or not.
         bool usesHardwareResolve = (userConfig.hardwareResolve != UserConfiguration::HardwareResolve::Disabled);
 
-        // Driver workarounds.
+        // Driver workarounds. The ones that switch to Vulkan are skipped while path tracing needs D3D12.
         const RenderDeviceVendor deviceVendor = device->getDescription().vendor;
         const uint64_t driverVersion = device->getDescription().driverVersion;
-        bool automaticGraphicsAPI = (userConfig.graphicsAPI == UserConfiguration::GraphicsAPI::Automatic);
+        bool automaticGraphicsAPI = automaticGraphicsAPIRequested && !pathTracingPrefersD3D12;
         bool forceVulkanForCompatibility = false;
         if (deviceVendor == RenderDeviceVendor::NVIDIA) {
             if (chosenGraphicsAPI == UserConfiguration::GraphicsAPI::D3D12) {
@@ -221,6 +281,7 @@ namespace RT64 {
             }
 
             chosenGraphicsAPI = UserConfiguration::GraphicsAPI::Vulkan;
+            graphicsAPIReason = "Automatic, driver workaround";
 
             device = renderInterface->createDevice();
             if (device == nullptr) {
@@ -228,6 +289,10 @@ namespace RT64 {
                 return SetupResult::GraphicsDeviceNotFound;
             }
         }
+
+        fprintf(stdout, "Graphics API: %s (%s) on %s.\n", graphicsAPIName(chosenGraphicsAPI), graphicsAPIReason, device->getDescription().name.c_str());
+        rtDiagLog("graphics API: %s (%s), device %s, path tracing %s", graphicsAPIName(chosenGraphicsAPI), graphicsAPIReason,
+            device->getDescription().name.c_str(), userConfig.advancedLighting ? "on" : "off");
 
         // Detect if the application should use HDR framebuffers or not.
         bool usesHDR;
@@ -693,6 +758,17 @@ namespace RT64 {
     }
 
     void Application::updateUserConfig(bool discardFBs) {
+#   ifdef _WIN64
+        // The graphics API can't change while running: turning path tracing on after Automatic picked another API needs a restart.
+        static bool pathTracingRestartLogged = false;
+        const bool automaticGraphicsAPI = (userConfig.graphicsAPI == UserConfiguration::GraphicsAPI::Automatic);
+        if (userConfig.advancedLighting && automaticGraphicsAPI && (chosenGraphicsAPI != UserConfiguration::GraphicsAPI::D3D12) && !pathTracingRestartLogged) {
+            pathTracingRestartLogged = true;
+            fprintf(stderr, "Path tracing was turned on while running on %s. Restart the game so the automatic graphics API picks D3D12.\n", graphicsAPIName(chosenGraphicsAPI));
+            rtDiagLog("path tracing turned on while running on %s; restart the game so Automatic picks D3D12", graphicsAPIName(chosenGraphicsAPI));
+        }
+#   endif
+
         sharedQueueResources->setUserConfig(userConfig, discardFBs);
     }
 

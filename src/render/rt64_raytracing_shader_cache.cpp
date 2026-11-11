@@ -167,11 +167,13 @@ namespace RT64 {
 
         RaytracingState &state = pendingState;
         state.pipeline = device->createRaytracingPipeline(pipelineDesc);
+        bool pipelineReady = state.pipeline != nullptr;
 #if defined(_WIN32)
-        auto *nativePipeline = static_cast<plume::D3D12RaytracingPipeline *>(state.pipeline.get());
-        const bool pipelineReady = (nativePipeline != nullptr) && (nativePipeline->stateObject != nullptr) && (nativePipeline->nameProgramMap.find(kPrimaryRayGen) != nativePipeline->nameProgramMap.end());
-#else
-        const bool pipelineReady = state.pipeline != nullptr;
+        // Only the D3D12 backend's pipeline is a D3D12RaytracingPipeline; Windows builds also run on Vulkan.
+        if (pipelineReady && (shaderFormat == RenderShaderFormat::DXIL)) {
+            auto *nativePipeline = static_cast<plume::D3D12RaytracingPipeline *>(state.pipeline.get());
+            pipelineReady = (nativePipeline->stateObject != nullptr) && (nativePipeline->nameProgramMap.find(kPrimaryRayGen) != nativePipeline->nameProgramMap.end());
+        }
 #endif
         if (!pipelineReady) {
             fprintf(stderr, "Failed to create the ray tracing pipeline.\n");
