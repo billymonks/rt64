@@ -156,6 +156,8 @@ static const uint kMaterialDecalOffsetShift = 8;
 static const uint kDecalRejectDistance = 2;
 static const uint kDecalRejectOrder = 3;
 static const uint kDecalRejectParallel = 4;
+// Only shown by the F10 decal view, not counted in the decal statistics (whose slot 5 is kDecalStatBehind).
+static const uint kDecalRejectOccluded = 5;
 
 // How far along the base's normal a decal may lie from it: its learned offset, or the default.
 float decalOffset(uint decalMaterial, float hitT) {
@@ -1561,6 +1563,26 @@ void PrimaryRayGen() {
                 if (layerHit.renderIndex < 0.0) {
                     break;
                 }
+
+                // A decal behind the base belongs to another surface when one lies between the base and the decal, or
+                // as far past the decal again (the floor under a rug seen through a table top): the base hides it.
+                const float behindBase = layerHit.nx - centerT;
+                if (behindBase > window) {
+                    RayDesc occluderRay;
+                    occluderRay.Origin = origin;
+                    occluderRay.Direction = direction;
+                    occluderRay.TMin = centerT + window;
+                    occluderRay.TMax = layerHit.nx + behindBase;
+                    HitPayload occluder = emptyPayload();
+                    occluder.hit = 1.0;
+                    occluder.hitT = centerT * RtParams.pixelSpreadAngle;
+                    occluder.fogFactor = RtParams.pixelSpreadAngle;
+                    TraceRay(SceneBVH, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, kCameraRayMask, 0, 0, 0, occluderRay, occluder);
+                    if (occluder.hit > 0.5) {
+                        decalDebug = float(kDecalRejectOccluded);
+                        break;
+                    }
+                }
             }
             else if (!tieBreakChanged) {
                 continue;
@@ -1779,10 +1801,12 @@ void DirectRayGen() {
             break;
         case 8: {
             // Decal resolve: green where a decal is shown; where one was found but not taken, yellow when it lies too
-            // far from the base, red when it was drawn before a character or small object, blue when not parallel.
+            // far from the base, red when it was drawn before a character or small object, blue when not parallel,
+            // magenta when the base hides it.
             const uint decalState = uint(gShadingSpecular[pix].x + 0.5);
             debugColor = (decalState == 1) ? float3(0.0, 0.9, 0.2) : ((decalState == kDecalRejectDistance) ? float3(1.0, 0.9, 0.0) :
-                ((decalState == kDecalRejectOrder) ? float3(1.0, 0.1, 0.1) : ((decalState == kDecalRejectParallel) ? float3(0.2, 0.4, 1.0) : float3(0.4, 0.4, 0.4))));
+                ((decalState == kDecalRejectOrder) ? float3(1.0, 0.1, 0.1) : ((decalState == kDecalRejectParallel) ? float3(0.2, 0.4, 1.0) :
+                ((decalState == kDecalRejectOccluded) ? float3(0.9, 0.2, 0.9) : float3(0.4, 0.4, 0.4)))));
             break;
         }
         }

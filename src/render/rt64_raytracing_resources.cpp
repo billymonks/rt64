@@ -1600,7 +1600,7 @@ namespace RT64 {
         "direct light factor",
         "draw id (each draw its own color)",
         "lit from a solid face pointing away from the sun (red) / two-sided (blue)",
-        "decal resolve (green: decal shown; decal found but not taken: yellow too far from the surface, red drawn before a character or small object, blue not parallel; grey: no decal)"
+        "decal resolve (green: decal shown; decal found but not taken: yellow too far from the surface, red drawn before a character or small object, blue not parallel, magenta hidden by the surface in front; grey: no decal)"
     };
 
     static std::atomic<uint32_t> debugViewMode(0);
