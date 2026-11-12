@@ -363,7 +363,8 @@ bool pixelInViewport(uint2 pix) {
 }
 
 bool isDiagPixel(uint2 pix) {
-    return all(pix == uint2(RtParams.resolution.xy * 0.5));
+    const float2 fraction = (RtParams.diagPixelX >= 0.0) ? saturate(float2(RtParams.diagPixelX, RtParams.diagPixelY)) : float2(0.5, 0.5);
+    return all(pix == min(uint2(RtParams.resolution.xy * fraction), uint2(RtParams.resolution.xy) - 1));
 }
 
 // cameraV.w is 2 on diagnostics capture frames.

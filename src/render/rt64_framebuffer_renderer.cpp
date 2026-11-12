@@ -2554,6 +2554,7 @@ namespace RT64 {
         rtParams.binaryLockMask = (rtResources->upscalerMode != UpscaleMode::FSR);
         rtParams.interleavedRastersCount = interleavedRastersCount;
         rtParams.debugView = raytracingDebugView();
+        raytracingDiagnosticsPixel(rtParams.diagPixelX, rtParams.diagPixelY);
 
         // rt_lights.json "room settings": rooms lit only by their manual and emissive lights. History is dropped for a
         // frame when it switches, so the old sun doesn't fade out over the new room.

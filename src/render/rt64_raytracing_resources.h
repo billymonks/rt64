@@ -753,6 +753,9 @@ namespace RT64 {
     // Asks the renderer to write a full diagnostics dump, including every 3D draw that isn't path traced, for the next
     // ray traced frame. Safe to call from any thread (the game binds it to F9).
     void requestRaytracingDiagnosticsCapture();
+    // The pixel the capture's "center" lines describe, as a fraction of the image; negative for the image center.
+    void setRaytracingDiagnosticsPixel(float x, float y);
+    void raytracingDiagnosticsPixel(float &x, float &y);
     void cycleRaytracingDebugView();
     uint32_t raytracingDebugView();
     void setRaytracingIndirectBounces(uint32_t bounces);

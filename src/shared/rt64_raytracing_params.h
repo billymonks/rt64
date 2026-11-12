@@ -119,6 +119,10 @@ namespace interop {
         float temporalMinBlend;
         float temporalMaxHistory;
         float temporalClipGamma;
+        // The pixel the F9 capture describes, as a fraction of the image (the mouse cursor when F9 was pressed), or
+        // negative for the image center.
+        float diagPixelX;
+        float diagPixelY;
 
 #   ifdef HLSL_CPU
         RaytracingParams() {
@@ -183,6 +187,8 @@ namespace interop {
             temporalMinBlend = 0.1f;
             temporalMaxHistory = 16.0f;
             temporalClipGamma = 1.5f;
+            diagPixelX = -1.0f;
+            diagPixelY = -1.0f;
         }
 #   endif
     };

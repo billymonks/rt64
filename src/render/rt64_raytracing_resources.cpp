@@ -1578,8 +1578,21 @@ namespace RT64 {
 
     static std::atomic<bool> diagnosticsCaptureRequested(false);
 
+    static std::atomic<float> diagnosticsPixelX(-1.0f);
+    static std::atomic<float> diagnosticsPixelY(-1.0f);
+
     void requestRaytracingDiagnosticsCapture() {
         diagnosticsCaptureRequested.store(true);
+    }
+
+    void setRaytracingDiagnosticsPixel(float x, float y) {
+        diagnosticsPixelX.store(x);
+        diagnosticsPixelY.store(y);
+    }
+
+    void raytracingDiagnosticsPixel(float &x, float &y) {
+        x = diagnosticsPixelX.load();
+        y = diagnosticsPixelY.load();
     }
 
     bool raytracingDiagnosticsCaptureRequested() {
@@ -2444,7 +2457,14 @@ namespace RT64 {
                 triangle[0], triangle[1], triangle[2], triangle[3], triangle[4], triangle[5], triangle[6], triangle[7], triangle[8], area, counters[23]);
             rtDiagLog("  camera hits whose shading normal disagrees with the face by more than about 72 degrees: %u; debug view %u (F10 cycles: 1 face normal, 2 shading normal, 3 disagreement in red, 4 sun visibility, 5 direct factor, 6 draw ids, 7 lit while facing away in red, 8 decals: green shown, yellow too far, red draw order, blue not parallel)",
                 counters[34], raytracingDebugView());
-            rtDiagLog("  note: the center lines describe whatever is exactly at the screen center, often the scenery behind the character in third person view");
+            float probeX, probeY;
+            raytracingDiagnosticsPixel(probeX, probeY);
+            if (probeX >= 0.0f) {
+                rtDiagLog("  note: the center lines describe the pixel under the mouse cursor when F9 was pressed, at %.3f %.3f of the image", probeX, probeY);
+            }
+            else {
+                rtDiagLog("  note: the center lines describe whatever is exactly at the screen center, often the scenery behind the character in third person view");
+            }
             float bounceFill[7];
             memcpy(bounceFill, &counters[35], sizeof(bounceFill));
             rtDiagLog("  indirect light: %u bounce%s; center pixel fill this frame from bounce 1 %.3f %.3f %.3f, from bounce 2 %.3f %.3f %.3f, fill strength %.2f",
