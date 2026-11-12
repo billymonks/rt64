@@ -37,6 +37,11 @@ static const float kSunTerminatorBand = 0.25;
 static const float kSunFaceFade = 0.05;
 // Smallest cosine between a smoothed vertex normal and its face's normal that is still trusted for shading.
 static const float kMinShadingNormalAgreement = 0.3;
+// Architecture (see shadeSurface): triangles at least this long count even outside scenery draws. Their vertex normals
+// shade fully smooth while every one is within about 23 degrees of the face, and flat past about 35 degrees.
+static const float kArchitectureTriangleEdge = 32.0;
+static const float kArchitectureFlatAgreement = 0.82;
+static const float kArchitectureSmoothAgreement = 0.92;
 // How much sun the back of a two-sided surface (cutout cloth, leaves) passes through.
 static const float kBackTranslucency = 0.35;
 // A triangle whose edge cross product is below this fraction of its edge lengths' product counts as degenerate.
@@ -777,6 +782,18 @@ void shadeSurface(uint renderIndex, uint primitiveIndex, float2 barycentrics, fl
             // don't describe) would light the face from the wrong side; the face's own normal is used instead.
             if (degenerate || (dot(candidate, geometricNormal) >= kMinShadingNormalAgreement)) {
                 shadingNormal = candidate;
+            }
+
+            // Buildings often share vertex normals across the corners of a box, bending them far from a flat wall's
+            // face, which shades the wall in curved patches. On architecture (scenery draws, or large triangles) a
+            // triangle whose vertex normals stray far from its face keeps the face; the gentle bends of a round tower
+            // stay smooth. The blend is per triangle, so it adds no edge inside one.
+            const float maxEdge = sqrt(max(dot(edge1, edge1), max(dot(edge2, edge2), dot(p2 - p1, p2 - p1))));
+            if (!degenerate && (((gRtMaterials[renderIndex] & kMaterialSceneryFlag) != 0) || (maxEdge >= kArchitectureTriangleEdge))) {
+                float agreement = min(abs(dot(normalize(loadNorm(i0)), geometricNormal)),
+                    min(abs(dot(normalize(loadNorm(i1)), geometricNormal)), abs(dot(normalize(loadNorm(i2)), geometricNormal))));
+                agreement = isfinite(agreement) ? agreement : 0.0;
+                shadingNormal = normalize(lerp(geometricNormal, shadingNormal, smoothstep(kArchitectureFlatAgreement, kArchitectureSmoothAgreement, agreement)));
             }
         }
     }
