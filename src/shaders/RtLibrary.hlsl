@@ -903,8 +903,10 @@ float traceShadow(float3 origin, float3 direction, float distance, float selfRen
     ray.TMin = 0.0;
     ray.TMax = max(distance, 1.0);
 
+    // Shadowed unless the ray misses: opaque geometry commits its hit without running ShadowAnyHit, and the closest
+    // hit shader is skipped, so only ShadowMiss can clear it.
     ShadowPayload payload;
-    payload.shadowed = 0.0;
+    payload.shadowed = 1.0;
     payload.selfRenderIndex = selfRenderIndex;
     payload.selfBillboard = ((selfRenderIndex >= 0.0) && ((gRtMaterials[uint(selfRenderIndex)] & kMaterialBillboardFlag) != 0)) ? 1.0 : 0.0;
     TraceRay(SceneBVH, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, kShadowRayMask, 1, 0, 1, ray, payload);
