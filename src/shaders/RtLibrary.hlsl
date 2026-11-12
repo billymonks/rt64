@@ -1137,7 +1137,7 @@ float3 emissiveRadiance(PointLight light) {
 // Light from the emissive lights at a surface. With shadows, the strongest kEmissiveShadowedLights lights get a
 // shadow ray, and the others take their average visibility. Lights moving in and out of the shadowed set then
 // change the result smoothly instead of switching their shadows on and off.
-float3 sampleEmissive(float3 position, float3 normal, float3 geometricNormal, float hitT, bool shadows, float2 noise) {
+float3 sampleEmissive(float3 position, float3 normal, float3 geometricNormal, float hitT, bool shadows, float2 noise, float selfRenderIndex) {
     float3 total = 0.0;
     float3 strongestLight[kEmissiveShadowedLights];
     float3 strongestDirection[kEmissiveShadowedLights];
@@ -1218,7 +1218,7 @@ float3 sampleEmissive(float3 position, float3 normal, float3 geometricNormal, fl
                 // Soft shadows: aim at a different point of the light's sphere each pixel and frame.
                 const float lightRadius = strongestRadius[s] * kEmissiveLightRadiusScale;
                 const float3 shadowDirection = sampleCone(strongestDirection[s], atan2(lightRadius, max(strongestDistance[s], 1e-3)), frac(noise + float2(0.37, 0.61) * float(s)));
-                const float visibility = 1.0 - traceShadow(shadowRayOrigin(position, geometricNormal, normal, shadowDirection, bias, false), shadowDirection, maxT, -1.0);
+                const float visibility = 1.0 - traceShadow(shadowRayOrigin(position, geometricNormal, normal, shadowDirection, bias, false), shadowDirection, maxT, selfRenderIndex);
                 tracedLight += strongestLight[s];
                 visibleLight += strongestLight[s] * visibility;
                 tracedLuminance += strongestLuminance[s];
@@ -1767,7 +1767,7 @@ void DirectRayGen() {
     [loop]
     for (uint s = 0; s < sampleCount; s++) {
         const LightSample sampled = sampleLight(position, normal, geometricNormal, hitT, selfRenderIndex, twoSided, pixelNoise(pix, 0, s));
-        const float3 sampledEmissive = kHybridLighting ? float3(0.0, 0.0, 0.0) : sampleEmissive(position, normal, geometricNormal, hitT, true, pixelNoise(pix, 1, s));
+        const float3 sampledEmissive = kHybridLighting ? float3(0.0, 0.0, 0.0) : sampleEmissive(position, normal, geometricNormal, hitT, true, pixelNoise(pix, 1, s), selfRenderIndex);
         if (s == 0) {
             light = sampled;
             emissive = sampledEmissive;
@@ -1881,7 +1881,7 @@ void IndirectRayGen() {
             const bool bounceTwoSided = hitTwoSided(bounce.hit);
             LightSample bounceSample = sampleLight(bouncePos, bounceNormal, bounceGeometricNormal, hitT + bounce.hitT, bounce.renderIndex, bounceTwoSided, pixelNoise(pix, 2, s));
             // Emissive lights at the bounce point, without shadow rays to keep the bounce cheap.
-            const float3 bounceEmissive = sampleEmissive(bouncePos, bounceNormal, bounceGeometricNormal, hitT + bounce.hitT, false, pixelNoise(pix, 3, s));
+            const float3 bounceEmissive = sampleEmissive(bouncePos, bounceNormal, bounceGeometricNormal, hitT + bounce.hitT, false, pixelNoise(pix, 3, s), -1.0);
             const float3 albedo1 = float3(bounce.ar, bounce.ag, bounce.ab);
             // An emissive surface (lava) the bounce ray hits gives off its own light too.
             bounceLight += albedo1 * (bounceSample.factor + bounceEmissive) + surfaceEmission(uint(bounce.renderIndex), albedo1);
@@ -1909,7 +1909,7 @@ void IndirectRayGen() {
                     const float3 secondHitGeometric = float3(second.gx, second.gy, second.gz);
                     const float secondHitT = hitT + bounce.hitT + second.hitT;
                     LightSample secondSample = sampleLight(secondPos, secondHitNormal, secondHitGeometric, secondHitT, second.renderIndex, hitTwoSided(second.hit), pixelNoise(pix, 4, s));
-                    const float3 secondEmissive = sampleEmissive(secondPos, secondHitNormal, secondHitGeometric, secondHitT, false, pixelNoise(pix, 5, s));
+                    const float3 secondEmissive = sampleEmissive(secondPos, secondHitNormal, secondHitGeometric, secondHitT, false, pixelNoise(pix, 5, s), -1.0);
                     const float3 shadowFloor = RtParams.cameraW.w * RtParams.cameraW.xyz;
                     const float3 albedo2 = float3(second.ar, second.ag, second.ab);
                     secondIncoming = albedo2 * (max(secondSample.factor - shadowFloor, 0.0) + secondEmissive) + surfaceEmission(uint(second.renderIndex), albedo2);
@@ -1925,10 +1925,11 @@ void IndirectRayGen() {
             bounceLight += skyLight;
         }
 
-        // Ray traced ambient occlusion: one short cosine weighted ray per sample.
+        // Ray traced ambient occlusion: one short cosine weighted ray per sample. Like the sun's shadow rays, it skips
+        // a billboard's own proxy, which crosses the sprite and would darken the half it leans over.
         const float3 occlusionDir = pixelCosineDirection(pix, uint2(31u, 17u), 11u, s, normal);
         if (dot(occlusionDir, geometricNormal) > 0.0) {
-            occlusion += traceShadow(origin, occlusionDir, kAORadius, -1.0);
+            occlusion += traceShadow(origin, occlusionDir, kAORadius, float(gInstanceId[pix]));
         }
     }
 
