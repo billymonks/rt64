@@ -17,6 +17,8 @@ Texture2D<float> gLumaAvg : register(t3);
 SamplerState gSampler : register(s4);
 // Primary hit coverage in alpha (gDiffuse of the ray tracer), at the ray tracing resolution.
 Texture2D<float4> gCoverage : register(t5);
+// Volumetric fog: its glow in rgb, what the air in shadow leaves of the background in alpha.
+Texture2D<float4> gVolumetric : register(t6);
 
 float4 ColorMotionBlurred(float2 uv) {
     if ((RtParams.motionBlurStrength > 0.0f) && (RtParams.motionBlurSamples > 0)) {
@@ -62,7 +64,7 @@ float4 PSMain(in float4 pos : SV_Position, in float2 uv : TEXCOORD0) : SV_TARGET
     color = clamp(color, 0.0f, 1.0f);
 
     // The upscaled image only replaces the pixels the rays hit, blended over the rasterized frame along the edges. Each
-    // ray tracing pixel was sampled at its jittered position.
+    // ray tracing pixel was sampled at its jittered position. The volumetric fog goes over it all later (VolumetricPS).
     if (RtParams.upscaleCoverage != 0) {
         const float2 coverageUV = uv - RtParams.pixelJitter * RtParams.resolution.zw;
         color.a = saturate(gCoverage.SampleLevel(gSampler, coverageUV, 0).a);

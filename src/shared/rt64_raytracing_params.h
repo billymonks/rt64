@@ -123,6 +123,56 @@ namespace interop {
         // negative for the image center.
         float diagPixelX;
         float diagPixelY;
+        // Volumetric fog of the room (rt_lights.json room settings "fog", Graphics menu "Volumetric Fog"): extinction
+        // per world unit at or below fogBaseHeight (0 turns the fog off), thinning by exp(-fogHeightFalloff * height
+        // above it). The tint of the light it scatters, a uniform glow (ambient), how strongly the sun or moon and the
+        // point lights glow in it, the Henyey-Greenstein anisotropy, and how far from the camera it reaches.
+        float fogDensity;
+        float fogHeightFalloff;
+        float fogBaseHeight;
+        float fogColorR;
+        float fogColorG;
+        float fogColorB;
+        float fogAmbient;
+        float fogSunScatter;
+        float fogLightScatter;
+        float fogAnisotropy;
+        float fogDistance;
+        // Multiplier of the game's own fog where the volumetric fog is on.
+        float fogGameScale;
+        // March steps per camera ray, and 0 when last frame's fog can't be reused (it was off or the room changed).
+        uint fogSteps;
+        uint fogHistory;
+        // How much the air the sun or moon doesn't reach darkens what is behind it (the shafts between shadows).
+        float fogShadows;
+        // God rays (0 strength when off): strength, reach (share of the viewport's larger side), color, window
+        // brightness, the direction towards their light where the sun or moon doesn't give it, and whether it does.
+        float raysStrength;
+        float raysLength;
+        float raysColorR;
+        float raysColorG;
+        float raysColorB;
+        float raysWindows;
+        float raysDirX;
+        float raysDirY;
+        float raysDirZ;
+        uint raysFromSun;
+        // How far the windows' rays turn from the light's direction towards the way they face out, and those ways:
+        // the frame's windows grouped by facing (up to 4, none when unknown or not turned).
+        float raysWindowBias;
+        uint raysWindowGroups;
+        float raysWindowGroup0X;
+        float raysWindowGroup0Y;
+        float raysWindowGroup0Z;
+        float raysWindowGroup1X;
+        float raysWindowGroup1Y;
+        float raysWindowGroup1Z;
+        float raysWindowGroup2X;
+        float raysWindowGroup2Y;
+        float raysWindowGroup2Z;
+        float raysWindowGroup3X;
+        float raysWindowGroup3Y;
+        float raysWindowGroup3Z;
 
 #   ifdef HLSL_CPU
         RaytracingParams() {
@@ -189,6 +239,37 @@ namespace interop {
             temporalClipGamma = 1.5f;
             diagPixelX = -1.0f;
             diagPixelY = -1.0f;
+            fogDensity = 0.0f;
+            fogHeightFalloff = 0.0f;
+            fogBaseHeight = 0.0f;
+            fogColorR = 1.0f;
+            fogColorG = 1.0f;
+            fogColorB = 1.0f;
+            fogAmbient = 0.0f;
+            fogSunScatter = 0.0f;
+            fogLightScatter = 0.0f;
+            fogAnisotropy = 0.0f;
+            fogDistance = 0.0f;
+            fogGameScale = 1.0f;
+            fogSteps = 0;
+            fogHistory = 0;
+            fogShadows = 0.0f;
+            raysStrength = 0.0f;
+            raysLength = 0.5f;
+            raysColorR = 1.0f;
+            raysColorG = 1.0f;
+            raysColorB = 1.0f;
+            raysWindows = 0.0f;
+            raysDirX = 0.0f;
+            raysDirY = 1.0f;
+            raysDirZ = 0.0f;
+            raysFromSun = 0;
+            raysWindowBias = 0.0f;
+            raysWindowGroups = 0;
+            raysWindowGroup0X = raysWindowGroup0Y = raysWindowGroup0Z = 0.0f;
+            raysWindowGroup1X = raysWindowGroup1Y = raysWindowGroup1Z = 0.0f;
+            raysWindowGroup2X = raysWindowGroup2Y = raysWindowGroup2Z = 0.0f;
+            raysWindowGroup3X = raysWindowGroup3Y = raysWindowGroup3Z = 0.0f;
         }
 #   endif
     };

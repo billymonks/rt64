@@ -73,6 +73,9 @@ namespace RT64 {
         // Trees and bushes drawn as cutout planes: soft, wrapped lighting (see RtMaterialFoliageFlag). Upright unlit
         // cutouts are treated this way anyway; the class forces it on for a texture.
         { "foliage", 0.9f, 0.0f, 0.0f },
+        // Windows (stained glass): god rays stream from them in their own color (see RtMaterialWindowFlag). Never
+        // guessed, only set by hand.
+        { "window", 0.9f, 0.0f, 0.0f },
     };
 
     const char *rtMaterialClassName(RtMaterialClass materialClass) {
@@ -761,6 +764,108 @@ namespace RT64 {
     // so an edited material shows in the game within a second.
     static const bool kMaterialsHotReload = true;
 
+    // A room setting's "fog" object, or one of its "times" keyframes over the base fog. Missing fields keep the base's.
+    static RtFogParams readFogParams(const json &value, const RtFogParams &base) {
+        auto number = [&](const char *key, float fallback, float lo, float hi) {
+            return (value.contains(key) && value[key].is_number()) ? std::clamp(value[key].get<float>(), lo, hi) : fallback;
+        };
+
+        RtFogParams fog = base;
+        fog.density = number("density", base.density, 0.0f, 1.0f);
+        if (value.contains("color") && value["color"].is_array()) {
+            readColor(value["color"], fog.color, 3);
+            for (float &c : fog.color) {
+                c = std::clamp(c, 0.0f, 4.0f);
+            }
+        }
+
+        fog.ambient = number("ambient", base.ambient, 0.0f, 4.0f);
+        fog.sun = number("sun", base.sun, 0.0f, 10.0f);
+        fog.lights = number("lights", base.lights, 0.0f, 10.0f);
+        fog.shadows = number("shadows", base.shadows, 0.0f, 4.0f);
+        fog.anisotropy = number("anisotropy", base.anisotropy, -0.9f, 0.9f);
+        fog.heightFalloff = number("height falloff", base.heightFalloff, 0.0f, 1.0f);
+        fog.baseHeight = number("base height", base.baseHeight, -100000.0f, 100000.0f);
+        fog.distance = number("distance", base.distance, 10.0f, 100000.0f);
+        fog.gameFog = number("game fog", base.gameFog, 0.0f, 1.0f);
+        fog.rays = number("rays", base.rays, 0.0f, 8.0f);
+        fog.raysLength = number("rays length", base.raysLength, 0.05f, 1.5f);
+        if (value.contains("rays color") && value["rays color"].is_array()) {
+            readColor(value["rays color"], fog.raysColor, 3);
+            for (float &c : fog.raysColor) {
+                c = std::clamp(c, 0.0f, 4.0f);
+            }
+        }
+
+        fog.windows = number("windows", base.windows, 0.0f, 8.0f);
+        fog.rayAzimuth = number("ray azimuth", base.rayAzimuth, -360.0f, 360.0f);
+        fog.rayElevation = number("ray elevation", base.rayElevation, -90.0f, 90.0f);
+        fog.windowBias = number("window bias", base.windowBias, 0.0f, 1.0f);
+        return fog;
+    }
+
+    static RtFogParams lerpFog(const RtFogParams &a, const RtFogParams &b, float t) {
+        auto mix = [t](float x, float y) { return x + (y - x) * t; };
+        RtFogParams fog;
+        fog.density = mix(a.density, b.density);
+        for (int c = 0; c < 3; c++) {
+            fog.color[c] = mix(a.color[c], b.color[c]);
+        }
+
+        fog.ambient = mix(a.ambient, b.ambient);
+        fog.sun = mix(a.sun, b.sun);
+        fog.lights = mix(a.lights, b.lights);
+        fog.shadows = mix(a.shadows, b.shadows);
+        fog.anisotropy = mix(a.anisotropy, b.anisotropy);
+        fog.heightFalloff = mix(a.heightFalloff, b.heightFalloff);
+        fog.baseHeight = mix(a.baseHeight, b.baseHeight);
+        fog.distance = mix(a.distance, b.distance);
+        fog.gameFog = mix(a.gameFog, b.gameFog);
+        fog.rays = mix(a.rays, b.rays);
+        fog.raysLength = mix(a.raysLength, b.raysLength);
+        for (int c = 0; c < 3; c++) {
+            fog.raysColor[c] = mix(a.raysColor[c], b.raysColor[c]);
+        }
+
+        fog.windows = mix(a.windows, b.windows);
+        fog.rayAzimuth = mix(a.rayAzimuth, b.rayAzimuth);
+        fog.rayElevation = mix(a.rayElevation, b.rayElevation);
+        fog.windowBias = mix(a.windowBias, b.windowBias);
+        return fog;
+    }
+
+    // The fog of a setting at an hour of the game clock: its keyframes interpolated around the clock (after the last
+    // one comes the first one of the next day).
+    static RtFogParams fogAtHour(const RtRoomSetting &setting, float hour) {
+        const std::vector<RtFogKey> &keys = setting.fogTimes;
+        if (keys.empty() || (hour < 0.0f)) {
+            return setting.fog;
+        }
+
+        if (keys.size() == 1) {
+            return keys[0].params;
+        }
+
+        size_t next = 0;
+        while ((next < keys.size()) && (keys[next].hour <= hour)) {
+            next++;
+        }
+
+        const RtFogKey &after = keys[next % keys.size()];
+        const RtFogKey &before = keys[(next + keys.size() - 1) % keys.size()];
+        float span = after.hour - before.hour;
+        float into = hour - before.hour;
+        if (span <= 0.0f) {
+            span += 24.0f;
+        }
+
+        if (into < 0.0f) {
+            into += 24.0f;
+        }
+
+        return lerpFog(before.params, after.params, (span > 1e-4f) ? std::clamp(into / span, 0.0f, 1.0f) : 0.0f);
+    }
+
     // Reads the "lights" list of an rt_lights.json; false when the file is missing or not valid JSON. Bad entries are
     // skipped.
     static bool readManualLightsDocument(const json &document, const std::string &source, std::vector<RtManualLight> &out, std::vector<RtRoomSetting> &settings, bool fromLocal) {
@@ -784,8 +889,29 @@ namespace RT64 {
                     RtRoomSetting setting;
                     setting.map = int(number(value, "map", -1.0f));
                     setting.room = int(number(value, "room", -1.0f));
-                    setting.sunAndMoon = !(value.contains("sun and moon") && value["sun and moon"].is_boolean() && !value["sun and moon"].get<bool>());
+                    setting.hasSunAndMoon = value.contains("sun and moon") && value["sun and moon"].is_boolean();
+                    setting.sunAndMoon = !(setting.hasSunAndMoon && !value["sun and moon"].get<bool>());
                     setting.fromLocal = fromLocal;
+                    // "fog": { "density": 0.002, "color": [r, g, b], ..., "times": [{ "hour": 6, "density": 0.004 }, ...] }
+                    if (value.contains("fog") && value["fog"].is_object()) {
+                        const json &fog = value["fog"];
+                        setting.hasFog = true;
+                        setting.fog = readFogParams(fog, RtFogParams());
+                        if (fog.contains("times") && fog["times"].is_array()) {
+                            for (const json &time : fog["times"]) {
+                                if (!time.is_object() || !time.contains("hour") || !time["hour"].is_number()) {
+                                    continue;
+                                }
+
+                                RtFogKey key;
+                                key.hour = std::fmod(std::fmod(time["hour"].get<float>(), 24.0f) + 24.0f, 24.0f);
+                                key.params = readFogParams(time, setting.fog);
+                                setting.fogTimes.push_back(key);
+                            }
+
+                            std::sort(setting.fogTimes.begin(), setting.fogTimes.end(), [](const RtFogKey &a, const RtFogKey &b) { return a.hour < b.hour; });
+                        }
+                    }
                     settings.push_back(setting);
                 }
                 catch (const std::exception &e) {
@@ -878,7 +1004,7 @@ namespace RT64 {
         std::scoped_lock lock(mutex);
         const RtRoomSetting *mapWide = nullptr;
         for (const RtRoomSetting &setting : roomSettings) {
-            if (setting.map != map) {
+            if ((setting.map != map) || !setting.hasSunAndMoon) {
                 continue;
             }
 
@@ -899,6 +1025,42 @@ namespace RT64 {
             return mapWide->sunAndMoon;
         }
 
+        return true;
+    }
+
+    bool RtMaterialDatabase::volumetricFog(int map, int room, float hour, RtFogParams &fog, const char *&source, const char *&scope) {
+        source = "default";
+        scope = "no entry";
+        fog = RtFogParams();
+        if (map < 0) {
+            return false;
+        }
+
+        std::scoped_lock lock(mutex);
+        const RtRoomSetting *chosen = nullptr;
+        for (const RtRoomSetting &setting : roomSettings) {
+            if ((setting.map != map) || !setting.hasFog) {
+                continue;
+            }
+
+            if ((setting.room >= 0) && (setting.room == room)) {
+                chosen = &setting;
+                scope = "room entry";
+                break;
+            }
+
+            if (setting.room < 0) {
+                chosen = &setting;
+                scope = "map-wide";
+            }
+        }
+
+        if (chosen == nullptr) {
+            return false;
+        }
+
+        source = chosen->fromLocal ? "local" : "shipped";
+        fog = fogAtHour(*chosen, hour);
         return true;
     }
 
@@ -968,9 +1130,10 @@ namespace RT64 {
         }
 
         const size_t sunOff = size_t(std::count_if(mergedSettings.begin(), mergedSettings.end(), [](const RtRoomSetting &setting) { return !setting.sunAndMoon; }));
-        rtDiagLog("manual lights: %zu (%zu enabled; %zu from %s, %zu shipped from %s%s); room settings: %zu (%zu with the sun and moon off)%s", merged->size(), enabled,
+        const size_t withFog = size_t(std::count_if(mergedSettings.begin(), mergedSettings.end(), [](const RtRoomSetting &setting) { return setting.hasFog; }));
+        rtDiagLog("manual lights: %zu (%zu enabled; %zu from %s, %zu shipped from %s%s); room settings: %zu (%zu with the sun and moon off, %zu with fog)%s", merged->size(), enabled,
             localLights.size(), authoringMode ? utf8(local).c_str() : "no Documents file", shippedLights.size(), shippedOrigin.c_str(), shippedRead ? "" : " - SHIPPED LIGHTS MISSING",
-            mergedSettings.size(), sunOff, authoringMode ? (localRead ? " (authoring mode: the Documents file wins by id)" : " (authoring mode, Documents file not found, using the shipped list)") : " (player mode: shipped configuration only)");
+            mergedSettings.size(), sunOff, withFog, authoringMode ? (localRead ? " (authoring mode: the Documents file wins by id)" : " (authoring mode, Documents file not found, using the shipped list)") : " (player mode: shipped configuration only)");
 
         // Enabled and total lights per area, and the rooms without the sun and moon, so a player's log shows what loaded.
         if (!onlyIfChanged) {
@@ -1065,14 +1228,29 @@ namespace RT64 {
             materialsWriteTime = writeTime;
             // Only the user's entries come from the file: the game's guesses in memory are as new as the file's.
             for (auto &pair : onDisk) {
-                if (!read || !pair.second.user) {
-                    continue;
+                if (!read) {
+                    break;
                 }
 
                 auto it = entries.find(pair.first);
+                if (!pair.second.user) {
+                    // Set by hand before and no longer (reverted to the guess in the file): the file's guess.
+                    if ((it != entries.end()) && it->second.user) {
+                        if (pair.second.preview.empty()) {
+                            pair.second.preview = it->second.preview;
+                        }
+
+                        it->second = pair.second;
+                        changed++;
+                    }
+
+                    continue;
+                }
+
                 if (it != entries.end()) {
                     const RtMaterialEntry &known = it->second;
-                    const bool same = known.user && (known.packed == pair.second.packed) && (known.emission == pair.second.emission) &&
+                    // packed is 0 whenever specular is, so the class is compared on its own.
+                    const bool same = known.user && (known.materialClass == pair.second.materialClass) && (known.packed == pair.second.packed) && (known.emission == pair.second.emission) &&
                         (known.emissionFromTexture == pair.second.emissionFromTexture) && (known.label == pair.second.label) &&
                         std::equal(std::begin(known.emissionColor), std::end(known.emissionColor), std::begin(pair.second.emissionColor));
                     if (same) {
@@ -1421,7 +1599,7 @@ function emitterRow(e,listed){
   el('td',{},'only kinds',kinds,'only areas ',areas),
   el('td',{},match));
 }
-const CLASSES=['matte','sprite','grass','dirt','wood','cloth','skin','stone','polished','metal','water','lava','foliage'];
+const CLASSES=['matte','sprite','grass','dirt','wood','cloth','skin','stone','polished','metal','water','lava','foliage','window'];
 function materialRow(e){
  const cls=el('select',{on:{change:ev=>{e.class=ev.target.value;if(e.class==='lava'&&!(e.emission>0)){e.roughness=0.7;e.metalness=0;e.specular=0.2;e.emission=1.5;e['emission color']='albedo';}touch(e);render();}}},...CLASSES.map(c=>el('option',{value:c,selected:e.class===c},c)));
  const fromTexture=!Array.isArray(e['emission color']);
@@ -1675,7 +1853,7 @@ fillAreas();render();
             "Ray traced surface materials, one entry per texture, grouped by where each was first seen.",
             "Easiest: click the surface in Eltale Studio (Rooms or Characters, Alt+click), or open rt_materials.html next to",
             "this file in Edge or Chrome, edit there and press Save.",
-            "class: matte, sprite, grass, dirt, wood, cloth, skin, stone, polished, metal or water.",
+            "class: matte, sprite, grass, dirt, wood, cloth, skin, stone, polished, metal, water, lava, foliage or window.",
             "roughness 0 (mirror) to 1 (matte); metalness 0 (plastic, stone) to 1 (metal); specular 0 (none) to 1 (full).",
             "Set source to \"user\" on an entry you edit, or the game may replace it with a new guess.",
             "The game reads the file when it starts, and its user entries again within a second of it changing. Only key,",

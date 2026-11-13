@@ -59,6 +59,7 @@
 #include "shaders/DebugPS.hlsl.spirv.h"
 #include "shaders/Im3DPS.hlsl.spirv.h"
 #include "shaders/PostProcessPS.hlsl.spirv.h"
+#include "shaders/VolumetricPS.hlsl.spirv.h"
 
 #ifdef _WIN32
 #   include "shaders/FbChangesClearCS.hlsl.dxil.h"
@@ -112,6 +113,7 @@
 #   include "shaders/DebugPS.hlsl.dxil.h"
 #   include "shaders/Im3DPS.hlsl.dxil.h"
 #   include "shaders/PostProcessPS.hlsl.dxil.h"
+#   include "shaders/VolumetricPS.hlsl.dxil.h"
 #elif defined(__APPLE__)
 #   include "shaders/FbChangesClearCS.hlsl.metal.h"
 #   include "shaders/FbChangesDrawColorPS.hlsl.metal.h"
@@ -164,6 +166,7 @@
 #   include "shaders/DebugPS.hlsl.metal.h"
 #   include "shaders/Im3DPS.hlsl.metal.h"
 #   include "shaders/PostProcessPS.hlsl.metal.h"
+#   include "shaders/VolumetricPS.hlsl.metal.h"
 #endif
 
 #include "shared/rt64_fb_common.h"
@@ -967,6 +970,34 @@ namespace RT64 {
             pipelineDesc.pixelShader = pixelShader.get();
             pipelineDesc.multisampling = multisampling;
             postProcess.pipeline = device->createGraphicsPipeline(pipelineDesc);
+        }
+
+        // Volumetric fog over the final 3D image (PostProcessPS's descriptor set): color * keep + glow.
+        {
+            PostProcessDescriptorSet descriptorSet(samplerLibrary);
+            layoutBuilder.begin();
+            layoutBuilder.addDescriptorSet(descriptorSet);
+            layoutBuilder.end();
+            volumetric.pipelineLayout = layoutBuilder.create(device);
+
+            std::unique_ptr<RenderShader> pixelShader = device->createShader(CREATE_SHADER_INPUTS(VolumetricPSBlobDXIL, VolumetricPSBlobSPIRV, VolumetricPSBlobMSL, "PSMain", shaderFormat));
+            RenderBlendDesc blend;
+            blend.blendEnabled = true;
+            blend.srcBlend = RenderBlend::ONE;
+            blend.dstBlend = RenderBlend::SRC1_COLOR;
+            blend.blendOp = RenderBlendOperation::ADD;
+            blend.srcBlendAlpha = RenderBlend::ZERO;
+            blend.dstBlendAlpha = RenderBlend::ONE;
+            blend.blendOpAlpha = RenderBlendOperation::ADD;
+            RenderGraphicsPipelineDesc pipelineDesc;
+            pipelineDesc.pipelineLayout = volumetric.pipelineLayout.get();
+            pipelineDesc.renderTargetBlend[0] = blend;
+            pipelineDesc.renderTargetFormat[0] = RenderTarget::colorBufferFormat(usesHDR);
+            pipelineDesc.renderTargetCount = 1;
+            pipelineDesc.vertexShader = fullScreenVertexShader.get();
+            pipelineDesc.pixelShader = pixelShader.get();
+            pipelineDesc.multisampling = multisampling;
+            volumetric.pipeline = device->createGraphicsPipeline(pipelineDesc);
         }
         
         // Raytracing debug.

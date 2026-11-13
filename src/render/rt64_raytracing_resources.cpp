@@ -188,6 +188,7 @@ namespace RT64 {
             filteredIndirectLightTexture[i] = makeTexture(device, textureWidth, textureHeight, RenderFormat::R16G16B16A16_FLOAT, uav);
             momentsTexture[i] = makeTexture(device, textureWidth, textureHeight, RenderFormat::R16G16B16A16_FLOAT, uav);
             lightVarianceTexture[i] = makeTexture(device, textureWidth, textureHeight, RenderFormat::R16G16B16A16_FLOAT, uav);
+            volumetricTexture[i] = makeTexture(device, textureWidth, textureHeight, RenderFormat::R16G16B16A16_FLOAT, uav);
             outputTexture[i] = worker->device->createTexture(RenderTextureDesc::ColorTarget(textureWidth, textureHeight, RenderFormat::R32G32B32A32_FLOAT));
             const RenderTexture *color = outputTexture[i].get();
             outputFramebuffer[i] = worker->device->createFramebuffer(RenderFramebufferDesc(&color, 1));
@@ -260,6 +261,7 @@ namespace RT64 {
         composeSet->setTexture(composeSet->gReflection, reflectionTexture.get(), RenderTextureLayout::SHADER_READ);
         composeSet->setTexture(composeSet->gRefraction, refractionTexture.get(), RenderTextureLayout::SHADER_READ);
         composeSet->setTexture(composeSet->gTransparent, transparentTexture.get(), RenderTextureLayout::SHADER_READ);
+        composeSet->setTexture(composeSet->gVolumetric, volumetricTexture[current].get(), RenderTextureLayout::SHADER_READ);
 
         if (rtParamsBuffer.get() != nullptr) {
             postProcessSet->setBuffer(postProcessSet->RtParams, rtParamsBuffer.get(), sizeof(interop::RaytracingParams));
@@ -269,6 +271,7 @@ namespace RT64 {
         postProcessSet->setTexture(postProcessSet->gFlow, flowTexture.get(), RenderTextureLayout::SHADER_READ);
         postProcessSet->setTexture(postProcessSet->gLumaAvg, lumaAverageTexture.get(), RenderTextureLayout::SHADER_READ);
         postProcessSet->setTexture(postProcessSet->gCoverage, diffuseTexture.get(), RenderTextureLayout::SHADER_READ);
+        postProcessSet->setTexture(postProcessSet->gVolumetric, volumetricTexture[current].get(), RenderTextureLayout::SHADER_READ);
         lumaSetSet->setTexture(lumaSetSet->LuminanceOutput, lumaAverageTexture.get(), RenderTextureLayout::GENERAL);
 
         indirectFilterSets[0]->setTexture(indirectFilterSets[0]->gInput, filteredIndirectLightTexture[0].get(), RenderTextureLayout::SHADER_READ);
@@ -1658,6 +1661,26 @@ namespace RT64 {
         return advancedWater.load();
     }
 
+    static std::atomic<bool> volumetricFogEnabled(true);
+
+    void setRaytracingVolumetricFog(bool enabled) {
+        volumetricFogEnabled.store(enabled);
+    }
+
+    bool raytracingVolumetricFog() {
+        return volumetricFogEnabled.load();
+    }
+
+    static std::atomic<bool> godRaysEnabled(true);
+
+    void setRaytracingGodRays(bool enabled) {
+        godRaysEnabled.store(enabled);
+    }
+
+    bool raytracingGodRays() {
+        return godRaysEnabled.load();
+    }
+
     void rtDiagLog(const char *fmt, ...) {
 #   if defined(_WIN32)
         const char *localAppData = std::getenv("LOCALAPPDATA");
@@ -1906,6 +1929,30 @@ namespace RT64 {
             }
             rtDiagLog("  room settings: sun and moon %s for map %d room %d (from %s, %s)", (rtParams.sunDisabled != 0) ? "OFF" : "ON", rtScene.areaMap, rtScene.areaRoom,
                 sunSettingSource, sunSettingScope);
+            rtDiagLog("  volumetric fog (%s, from %s, %s, clock %.2f h): density %.5f, color (%.2f, %.2f, %.2f), ambient %.2f, sun %.2f, lights %.2f, shadows %.2f, anisotropy %.2f, height falloff %.4f above %.1f, distance %.0f, game fog x%.2f, %u steps",
+                raytracingVolumetricFog() ? "on in the Graphics menu" : "OFF in the Graphics menu", fogSettingSource, fogSettingScope, lastFogHour, rtParams.fogDensity,
+                rtParams.fogColorR, rtParams.fogColorG, rtParams.fogColorB, rtParams.fogAmbient, rtParams.fogSunScatter, rtParams.fogLightScatter, rtParams.fogShadows, rtParams.fogAnisotropy,
+                rtParams.fogHeightFalloff, rtParams.fogBaseHeight, rtParams.fogDistance, rtParams.fogGameScale, rtParams.fogSteps);
+            rtDiagLog("  god rays (%s): strength %.2f, length %.2f, color (%.2f, %.2f, %.2f), from %s, windows %.2f (%u window draws path traced), bias %.2f, %u facing groups",
+                raytracingGodRays() ? "on in the Graphics menu" : "OFF in the Graphics menu", rtParams.raysStrength, rtParams.raysLength,
+                rtParams.raysColorR, rtParams.raysColorG, rtParams.raysColorB, (rtParams.raysFromSun != 0) ? "the sun or moon and the sky" : "the room's ray direction",
+                rtParams.raysWindows, lastWindowDraws, rtParams.raysWindowBias, rtParams.raysWindowGroups);
+            const float groupNormals[4][3] = {
+                { rtParams.raysWindowGroup0X, rtParams.raysWindowGroup0Y, rtParams.raysWindowGroup0Z },
+                { rtParams.raysWindowGroup1X, rtParams.raysWindowGroup1Y, rtParams.raysWindowGroup1Z },
+                { rtParams.raysWindowGroup2X, rtParams.raysWindowGroup2Y, rtParams.raysWindowGroup2Z },
+                { rtParams.raysWindowGroup3X, rtParams.raysWindowGroup3Y, rtParams.raysWindowGroup3Z },
+            };
+            for (uint32_t g = 0; (g < rtParams.raysWindowGroups) && (g < 4); g++) {
+                rtDiagLog("    windows facing out (%.2f, %.2f, %.2f)", groupNormals[g][0], groupNormals[g][1], groupNormals[g][2]);
+            }
+            if (gameFogEnd > 0.0f) {
+                rtDiagLog("  game fog: from %.0f to %.0f units, color (%.2f, %.2f, %.2f), mul %.1f offset %.1f", gameFogStart, gameFogEnd,
+                    rtScene.gameFogColor[0], rtScene.gameFogColor[1], rtScene.gameFogColor[2], rtScene.gameFogMul, rtScene.gameFogOffset);
+            }
+            else {
+                rtDiagLog("  game fog: none on the path traced draws%s", rtScene.gameFogValid ? " (found, but its range couldn't be worked out)" : "");
+            }
         }
 
         std::sort(keyStats.begin(), keyStats.end(), [](const KeyStats &a, const KeyStats &b) { return a.pieces > b.pieces; });

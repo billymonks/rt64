@@ -214,6 +214,8 @@ namespace RT64 {
         uint32_t gFilteredIndirectLight;
         uint32_t gBlueNoise;
         uint32_t gRtMaterials;
+        uint32_t gVolumetric;
+        uint32_t gPrevVolumetric;
 
         FramebufferRendererDescriptorCommonSet(const SamplerLibrary &samplerLibrary, bool raytracing, RenderDevice *device = nullptr) {
             builder.begin();
@@ -285,6 +287,8 @@ namespace RT64 {
             gFilteredIndirectLight = builder.addReadWriteTexture(66);
             gBlueNoise = builder.addTexture(67);
             gRtMaterials = builder.addStructuredBuffer(68);
+            gVolumetric = builder.addReadWriteTexture(69);
+            gPrevVolumetric = builder.addReadWriteTexture(70);
             builder.end();
 
             if (device != nullptr) {
@@ -549,6 +553,7 @@ namespace RT64 {
         uint32_t gLumaAvg;
         uint32_t gSampler;
         uint32_t gCoverage;
+        uint32_t gVolumetric;
 
         PostProcessDescriptorSet(const SamplerLibrary &samplerLibrary, RenderDevice *device = nullptr) {
             builder.begin();
@@ -558,6 +563,7 @@ namespace RT64 {
             gLumaAvg = builder.addTexture(3);
             gSampler = builder.addImmutableSampler(4, samplerLibrary.linear.clampClamp.get());
             gCoverage = builder.addTexture(5);
+            gVolumetric = builder.addTexture(6);
             builder.end();
 
             if (device != nullptr) {
@@ -575,6 +581,7 @@ namespace RT64 {
         uint32_t gReflection;
         uint32_t gRefraction;
         uint32_t gTransparent;
+        uint32_t gVolumetric;
 
         RaytracingComposeDescriptorSet(const SamplerLibrary &samplerLibrary, RenderDevice *device = nullptr) {
             builder.begin();
@@ -586,6 +593,7 @@ namespace RT64 {
             gReflection = builder.addTexture(5);
             gRefraction = builder.addTexture(6);
             gTransparent = builder.addTexture(7);
+            gVolumetric = builder.addTexture(8);
             builder.end();
 
             if (device != nullptr) {

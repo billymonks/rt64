@@ -30,5 +30,8 @@ namespace RT64 {
         int map = -1;
         int room = -1;
         const char *areaName = "";
+
+        // The game clock as an hour of the day (0 to 24), for the fog keyframes of rt_lights.json; negative when unknown.
+        float clockHour = -1.0f;
     };
 };

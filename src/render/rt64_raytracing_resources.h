@@ -78,6 +78,8 @@ namespace RT64 {
     // A camera facing billboard with a light facing shadow proxy: proxies close to it don't shadow it (its own, and
     // the other draws of a tree split into several).
     static const uint32_t RtMaterialBillboardFlag = 1u << 25;
+    // A window (rt_materials.json class "window", stained glass): god rays stream from its pixels in its color.
+    static const uint32_t RtMaterialWindowFlag = 1u << 24;
     // Largest learned offset of a decal from its surface (kDecalMaxOffset in RtLibrary.hlsl).
     static const float RtDecalMaxOffset = 16.0f;
 
@@ -283,6 +285,26 @@ namespace RT64 {
         uint32_t probeVertex = 0;
         float probeWorld[3] = {};
         float probeClipRSP[4] = {};
+
+        // The game's own N64 fog on the path traced draw with the most triangles that uses it: the fog color and the
+        // RSP fog multiplier and offset (vertex fog alpha = max(z, 0) / w * mul + offset, out of 255).
+        // Path traced draws of window textures (rt_materials.json class "window"), the indoor sources of god rays.
+        uint32_t windowDraws = 0;
+        // 3D draws are rasterized after this scene, and the volumetric fog goes over the image after them.
+        bool volumetricLater = false;
+        // Their facing (see measureWindow), which bends their god rays to shine in through them.
+        struct WindowInfo {
+            float center[3] = {};
+            float normal[3] = {};
+            float area = 0.0f;
+        };
+
+        std::vector<WindowInfo> windows;
+        bool gameFogValid = false;
+        uint32_t gameFogTriangles = 0;
+        float gameFogColor[3] = {};
+        float gameFogMul = 0.0f;
+        float gameFogOffset = 0.0f;
     };
 
     struct RaytracingResources {
@@ -419,6 +441,8 @@ namespace RT64 {
         std::unique_ptr<RenderTexture> depthTexture[2];
         std::unique_ptr<RenderTexture> filteredDirectLightTexture[2];
         std::unique_ptr<RenderTexture> filteredIndirectLightTexture[2];
+        // Volumetric fog (gVolumetric), this frame's and last frame's by swapBuffers like the light accumulation.
+        std::unique_ptr<RenderTexture> volumetricTexture[2];
         std::unique_ptr<RenderTexture> outputTexture[2];
         std::unique_ptr<RenderFramebuffer> outputFramebuffer[2];
         std::unique_ptr<RenderTexture> upscaledOutputTexture;
@@ -563,6 +587,21 @@ namespace RT64 {
         // The room's sun and moon setting (rt_lights.json "room settings") last frame and where it came from.
         int32_t lastSunDisabled = -1;
         uint32_t lastIndirectBounces = 0;
+        // The room's volumetric fog (rt_lights.json room settings "fog") last frame: whether it was on, in which area,
+        // and where it came from.
+        bool lastFogActive = false;
+        int32_t lastFogMap = -1;
+        int32_t lastFogRoom = -1;
+        float lastFogHour = -1.0f;
+        const char *fogSettingSource = "default";
+        const char *fogSettingScope = "no entry";
+        // Where the game's own fog starts and ends this frame, in world units from the camera (-1 when it has none).
+        // Path traced window draws last frame (god ray sources indoors).
+        uint32_t lastWindowDraws = 0;
+        // Where the path traced scene's image went, for the volumetric fog pass over it (FramebufferRenderer::submitVolumetric).
+        RenderRect volumetricScissor;
+        float gameFogStart = -1.0f;
+        float gameFogEnd = -1.0f;
         // Decals (by texture, vertex load and size) that three decal checks in a row saw mostly missed: rasterized after
         // the path traced pass, by the frame they fell back on, and tried again after a while. Each decal's learned
         // offset from its surface (normal distance, up to 16 units) and its count of bad checks in a row.
@@ -761,6 +800,12 @@ namespace RT64 {
     void setRaytracingIndirectBounces(uint32_t bounces);
     void setRaytracingAdvancedWater(bool enabled);
     bool raytracingAdvancedWater();
+    // Graphics menu "Volumetric Fog": the fog of rt_lights.json's room settings is ray marched.
+    void setRaytracingVolumetricFog(bool enabled);
+    bool raytracingVolumetricFog();
+    // Graphics menu "God Rays": screen space rays from the sky around the sun or moon and from window textures.
+    void setRaytracingGodRays(bool enabled);
+    bool raytracingGodRays();
     void toggleRaytracingSecondBounce();
     uint32_t raytracingIndirectBounces();
     bool raytracingDiagnosticsCaptureRequested();

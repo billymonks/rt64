@@ -37,6 +37,7 @@ namespace RT64 {
         Water,
         Lava,
         Foliage,
+        Window,
         Count
     };
 
@@ -268,12 +269,64 @@ namespace RT64 {
         float flickerPhase = 0.0f;
     };
 
-    // rt_lights.json "room settings": per map (room -1 for all its rooms) or per room, whether the sun or moon lights it.
+    // Volumetric fog of a room (rt_lights.json room settings "fog"). Density is the extinction per world unit at or
+    // below the base height, thinning by exp(-height falloff * height above it).
+    struct RtFogParams {
+        // The fog only changes the image where it is lit unevenly: air in the sun's or moon's shadow darkens what is
+        // behind it (so the lit air between shadows reads as shafts), and lights glow in it. Evenly lit fog, open
+        // country in full sun, leaves the image as it was.
+        float density = 0.0f;
+        // Tint of the light it scatters (times the light's own color).
+        float color[3] = { 1.0f, 1.0f, 1.0f };
+        // A uniform glow everywhere in it, as a fraction of its color (mist); 0 for shafts only.
+        float ambient = 0.0f;
+        // How strongly the sun or moon (looking towards it) and the point lights glow in it.
+        float sun = 1.0f;
+        float lights = 1.0f;
+        // How much air in the sun's or moon's shadow darkens what is behind it.
+        float shadows = 0.8f;
+        // Henyey-Greenstein g: how tightly the sun's glow gathers around it.
+        float anisotropy = 0.7f;
+        float heightFalloff = 0.0f;
+        float baseHeight = 0.0f;
+        // How far from the camera the fog reaches; it fades out over the second half.
+        float distance = 1000.0f;
+        // Multiplier of the game's own N64 fog where the volumetric fog is on.
+        float gameFog = 1.0f;
+        // God rays (screen space, Graphics menu "God Rays"): their strength, how far across the screen they reach (a
+        // share of its larger side), their tint (times the sun's or moon's color), how brightly window textures
+        // (rt_materials.json class "window") shine them, and where their light comes from where the sun or moon is
+        // off: a compass angle around the world's vertical (0 = +z, 90 = +x) and a height above the horizon, degrees.
+        float rays = 1.0f;
+        float raysLength = 0.5f;
+        float raysColor[3] = { 1.0f, 1.0f, 1.0f };
+        float windows = 1.0f;
+        float rayAzimuth = 0.0f;
+        float rayElevation = 75.0f;
+        // How far window rays turn from that light direction (or the sun's) to shine straight in through the windows
+        // they come from: 0 = all from the light's direction, 1 = straight in along the window's facing.
+        float windowBias = 0.6f;
+    };
+
+    // A fog keyframe of "times": the room's fog at this hour of the game clock (0 to 24).
+    struct RtFogKey {
+        float hour = 0.0f;
+        RtFogParams params;
+    };
+
+    // rt_lights.json "room settings": per map (room -1 for all its rooms) or per room, whether the sun or moon lights it
+    // and its volumetric fog.
     struct RtRoomSetting {
         int map = -1;
         int room = -1;
+        // An entry only decides the settings it has: one with just a fog leaves the sun and moon to the map's entry.
+        bool hasSunAndMoon = false;
         bool sunAndMoon = true;
         bool fromLocal = true;
+        bool hasFog = false;
+        RtFogParams fog;
+        // Sorted by hour; empty when the fog doesn't change with the clock.
+        std::vector<RtFogKey> fogTimes;
     };
 
     struct RtMaterialProbe {
@@ -339,6 +392,9 @@ namespace RT64 {
         // Whether the sun or moon lights this room, and where that comes from: "default", "local" or "shipped", and
         // whether a "map-wide" or "room" entry decided it.
         bool sunAndMoonEnabled(int map, int room, const char *&source, const char *&scope);
+        // The volumetric fog of this room at the game clock's hour (negative when unknown: the entry's own values), from
+        // the room's entry with a "fog" or else the map-wide one. False when neither has one.
+        bool volumetricFog(int map, int room, float hour, RtFogParams &fog, const char *&source, const char *&scope);
         // Called once per frame: about once a second asks the background thread whether rt_lights.json or
         // rt_materials.json changed (see kManualLightsHotReload and kMaterialsHotReload).
         void pollEditedFiles();

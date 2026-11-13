@@ -56,6 +56,10 @@ RWTexture2D<float4> gFilteredIndirectLight : register(u66, space0);
 Texture2D<float4> gBlueNoise : register(t67, space0);
 // Packed surface material by render index (RtMaterialDatabase): roughness, metalness, specular strength, class.
 StructuredBuffer<uint> gRtMaterials : register(t68, space0);
+// Volumetric fog along the camera ray (DirectRayGen): light scattered towards the camera in rgb, what's left of the
+// surface behind in alpha. Last frame's is blended in as history.
+RWTexture2D<float4> gVolumetric : register(u69, space0);
+RWTexture2D<float4> gPrevVolumetric : register(u70, space0);
 
 // Set 3 - Framebuffer.
 Texture2D<float4> gBackgroundColor : register(t1, space3);

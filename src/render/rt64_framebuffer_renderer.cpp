@@ -233,6 +233,61 @@ namespace RT64 {
         ShadowVec3 position;
     };
 
+    // The facing of a window draw: its center and its triangles' area weighted normal, each triangle turned to agree
+    // with the first one (which side is indoors is decided later, by the camera).
+    static bool measureWindow(const DrawData &drawData, uint32_t faceIndicesStart, uint32_t triangleCount, RaytracingScene::WindowInfo &info) {
+        const uint32_t MaxTriangles = 128;
+        ShadowVec3 normalSum = { 0.0f, 0.0f, 0.0f };
+        ShadowVec3 centerSum = { 0.0f, 0.0f, 0.0f };
+        ShadowVec3 firstNormal = { 0.0f, 0.0f, 0.0f };
+        float areaSum = 0.0f;
+        for (uint32_t t = 0; t < std::min(triangleCount, MaxTriangles); t++) {
+            ShadowVec3 p[3];
+            bool valid = true;
+            for (uint32_t v = 0; v < 3; v++) {
+                const uint32_t index = faceIndicesStart + t * 3 + v;
+                const interop::float4x4 *transform = nullptr;
+                valid = valid && (index < drawData.faceIndices.size()) && scenePosition(drawData, drawData.faceIndices[index], p[v].x, p[v].y, p[v].z, transform);
+            }
+
+            if (!valid) {
+                continue;
+            }
+
+            ShadowVec3 normal = (p[1] - p[0]).cross(p[2] - p[0]);
+            const float area = normal.length();
+            if (area < 1e-4f) {
+                continue;
+            }
+
+            if (areaSum <= 0.0f) {
+                firstNormal = normal;
+            }
+            else if (normal.dot(firstNormal) < 0.0f) {
+                normal = normal * -1.0f;
+            }
+
+            normalSum = normalSum + normal;
+            centerSum = centerSum + (p[0] + p[1] + p[2]) * (area / 3.0f);
+            areaSum += area;
+        }
+
+        const float normalLength = normalSum.length();
+        if ((areaSum <= 0.0f) || (normalLength < 1e-4f)) {
+            return false;
+        }
+
+        const ShadowVec3 center = centerSum * (1.0f / areaSum);
+        info.center[0] = center.x;
+        info.center[1] = center.y;
+        info.center[2] = center.z;
+        info.normal[0] = normalSum.x / normalLength;
+        info.normal[1] = normalSum.y / normalLength;
+        info.normal[2] = normalSum.z / normalLength;
+        info.area = areaSum * 0.5f;
+        return true;
+    }
+
     struct ShadowFitRange {
         uint32_t indexStart = 0;
         uint32_t indexCount = 0;
@@ -978,6 +1033,23 @@ namespace RT64 {
 
     // Adds an emissive draw's triangles to the cells of a world grid, weighted by area: the lava lights are placed at
     // the cells' centroids. Snapping to the grid keeps them where they are from frame to frame.
+    // Volumetric fog density of outdoor rooms without a "fog" in rt_lights.json (the other values are RtFogParams'
+    // defaults), and how much thicker it gets around sunrise and sunset.
+    static const float kAutomaticFogDensity = 0.002f;
+    static const float kAutomaticFogGoldenHourBoost = 0.75f;
+
+    // 1 at 6:30 and 17:30 on the game clock (sunrise is 5:00, sunset 19:00), falling to 0 two and a half hours either
+    // side; 0 when the clock is unknown.
+    static float goldenHour(float hour) {
+        if (hour < 0.0f) {
+            return 0.0f;
+        }
+
+        const float dawn = 1.0f - std::clamp(std::abs(hour - 6.5f) / 2.5f, 0.0f, 1.0f);
+        const float dusk = 1.0f - std::clamp(std::abs(hour - 17.5f) / 2.5f, 0.0f, 1.0f);
+        return std::max(dawn, dusk);
+    }
+
     static const float kEmissiveCellSize = 96.0f;
 
     static void accumulateEmissiveCells(const DrawData &drawData, uint32_t indexStart, uint32_t triangleCount, const float radiance[3],
@@ -1724,6 +1796,8 @@ namespace RT64 {
             descCommonSet->setTexture(descCommonSet->gPrevIndirectLightAccum, rtResources->indirectLightTexture[rtResources->swapBuffers ? 0 : 1].get(), RenderTextureLayout::GENERAL);
             descCommonSet->setTexture(descCommonSet->gFilteredDirectLight, rtResources->filteredDirectLightTexture[1].get(), RenderTextureLayout::GENERAL);
             descCommonSet->setTexture(descCommonSet->gFilteredIndirectLight, rtResources->filteredIndirectLightTexture[1].get(), RenderTextureLayout::GENERAL);
+            descCommonSet->setTexture(descCommonSet->gVolumetric, rtResources->volumetricTexture[rtResources->swapBuffers ? 1 : 0].get(), RenderTextureLayout::GENERAL);
+            descCommonSet->setTexture(descCommonSet->gPrevVolumetric, rtResources->volumetricTexture[rtResources->swapBuffers ? 0 : 1].get(), RenderTextureLayout::GENERAL);
 
             const uint32_t hitBufferBytes = 256;
             descCommonSet->setBuffer(descCommonSet->gHitVelocityDistance, rtResources->hitVelocityDistanceBuffer.get(), hitBufferBytes, rtResources->hitVelocityDistanceBufferView.get());
@@ -2580,6 +2654,153 @@ namespace RT64 {
             rtResources->sunSettingScope = scope;
         }
 
+        // rt_lights.json room settings "fog" (volumetric fog and god rays), at the game clock's hour. Rooms without one
+        // get the defaults: where the sun or moon is on, fog thicker around sunrise and sunset and god rays from the sky;
+        // indoors (lights placed by hand) only god rays from window textures. The game's own fog range is only worked
+        // out for the log. Last frame's fog is reused unless it was off or the room changed.
+        {
+            const char *source = "default";
+            const char *scope = "no entry";
+            RtFogParams fog;
+            bool hasFog = rtMaterialDatabase().volumetricFog(rtScene.areaMap, rtScene.areaRoom, lightingSceneLight.clockHour, fog, source, scope);
+            rtResources->gameFogStart = -1.0f;
+            rtResources->gameFogEnd = -1.0f;
+            if (rtScene.gameFogValid && (rtScene.gameFogMul > 0.0f)) {
+                // Vertex fog alpha is max(z, 0) / w * mul + offset (out of 255), and z / w = P32 / d - P22 at view
+                // distance d. The view matrix's scale turns view distances into world ones.
+                const hlslpp::float4x4 &p = rtScene.curProjMatrix;
+                const hlslpp::float4x4 &v = rtScene.curViewMatrix;
+                const float viewScale = std::sqrt(v[0][0] * v[0][0] + v[0][1] * v[0][1] + v[0][2] * v[0][2]);
+                auto worldDistance = [&](float alpha) {
+                    const float ndc = std::max((alpha - rtScene.gameFogOffset) / rtScene.gameFogMul, 0.0f);
+                    const float denominator = ndc + p[2][2];
+                    return (std::abs(denominator) > 1e-6f) ? (p[3][2] / denominator) / std::max(viewScale, 1e-6f) : -1.0f;
+                };
+
+                const float start = worldDistance(0.0f);
+                const float end = worldDistance(255.0f);
+                if ((end > 1.0f) && std::isfinite(end)) {
+                    rtResources->gameFogStart = std::max(start, 0.0f);
+                    rtResources->gameFogEnd = end;
+                }
+            }
+
+            const bool sunOn = (rtParams.sunDisabled == 0);
+            if (!hasFog) {
+                hasFog = true;
+                source = "the defaults";
+                scope = sunOn ? "automatic outdoors, no rt_lights.json fog for this room" : "indoors: god rays from windows only, no rt_lights.json fog for this room";
+                fog.density = sunOn ? kAutomaticFogDensity * (1.0f + kAutomaticFogGoldenHourBoost * goldenHour(lightingSceneLight.clockHour)) : 0.0f;
+            }
+
+            const bool fogActive = raytracingVolumetricFog() && (fog.density > 0.0f) && (raytracingDebugView() == 0);
+            const bool raysActive = raytracingGodRays() && (fog.rays > 0.0f) && (sunOn || (rtScene.windowDraws > 0)) && (raytracingDebugView() == 0);
+            const bool active = fogActive || raysActive;
+            rtParams.fogDensity = fogActive ? fog.density : 0.0f;
+            rtParams.fogHeightFalloff = fog.heightFalloff;
+            rtParams.fogBaseHeight = fog.baseHeight;
+            rtParams.fogColorR = fog.color[0];
+            rtParams.fogColorG = fog.color[1];
+            rtParams.fogColorB = fog.color[2];
+            rtParams.fogAmbient = fog.ambient;
+            rtParams.fogSunScatter = fog.sun;
+            rtParams.fogLightScatter = fog.lights;
+            rtParams.fogAnisotropy = fog.anisotropy;
+            rtParams.fogDistance = fog.distance;
+            rtParams.fogGameScale = fogActive ? fog.gameFog : 1.0f;
+            rtParams.fogShadows = fog.shadows;
+            rtParams.fogSteps = 12;
+            rtParams.raysStrength = raysActive ? fog.rays : 0.0f;
+            rtParams.raysLength = fog.raysLength;
+            rtParams.raysColorR = fog.raysColor[0];
+            rtParams.raysColorG = fog.raysColor[1];
+            rtParams.raysColorB = fog.raysColor[2];
+            rtParams.raysWindows = fog.windows;
+            const float azimuth = fog.rayAzimuth * (3.14159265f / 180.0f);
+            const float elevation = fog.rayElevation * (3.14159265f / 180.0f);
+            rtParams.raysDirX = std::cos(elevation) * std::sin(azimuth);
+            rtParams.raysDirY = std::sin(elevation);
+            rtParams.raysDirZ = std::cos(elevation) * std::cos(azimuth);
+            rtParams.raysFromSun = sunOn ? 1u : 0u;
+
+            // Where the windows face out, grouped so each wall's windows shine in their own way: each window's normal
+            // turned away from the camera (the camera is indoors), weighted by its area over its squared distance.
+            // The heaviest windows start the groups; a window joins the group facing within ~35 degrees of it, or
+            // the closest one once there are 4 (the shader picks a window pixel's group the same way).
+            struct WindowGroup { float sum[3]; float normal[3]; };
+            const uint32_t MaxWindowGroups = 4;
+            const float GroupCosine = 0.82f;
+            struct Facing { float normal[3]; float weight; };
+            std::vector<Facing> facings;
+            const float camera[3] = { float(rtParams.cameraV.x), float(rtParams.cameraV.y), float(rtParams.cameraV.z) };
+            for (const RaytracingScene::WindowInfo &window : rtScene.windows) {
+                const float toCamera[3] = { camera[0] - window.center[0], camera[1] - window.center[1], camera[2] - window.center[2] };
+                const float distance2 = std::max(toCamera[0] * toCamera[0] + toCamera[1] * toCamera[1] + toCamera[2] * toCamera[2], 1.0f);
+                const float facing = window.normal[0] * toCamera[0] + window.normal[1] * toCamera[1] + window.normal[2] * toCamera[2];
+                const float flip = (facing > 0.0f) ? -1.0f : 1.0f;
+                facings.push_back({ { window.normal[0] * flip, window.normal[1] * flip, window.normal[2] * flip }, window.area / distance2 });
+            }
+
+            std::sort(facings.begin(), facings.end(), [](const Facing &a, const Facing &b) { return a.weight > b.weight; });
+            std::vector<WindowGroup> groups;
+            for (const Facing &facing : facings) {
+                int best = -1;
+                float bestDot = -2.0f;
+                for (size_t g = 0; g < groups.size(); g++) {
+                    const float d = facing.normal[0] * groups[g].normal[0] + facing.normal[1] * groups[g].normal[1] + facing.normal[2] * groups[g].normal[2];
+                    if (d > bestDot) {
+                        bestDot = d;
+                        best = int(g);
+                    }
+                }
+
+                if ((best < 0) || ((bestDot < GroupCosine) && (groups.size() < MaxWindowGroups))) {
+                    groups.push_back({ { 0.0f, 0.0f, 0.0f }, { facing.normal[0], facing.normal[1], facing.normal[2] } });
+                    best = int(groups.size() - 1);
+                }
+
+                WindowGroup &group = groups[best];
+                for (int c = 0; c < 3; c++) {
+                    group.sum[c] += facing.normal[c] * facing.weight;
+                }
+
+                const float length = std::sqrt(group.sum[0] * group.sum[0] + group.sum[1] * group.sum[1] + group.sum[2] * group.sum[2]);
+                if (length > 1e-12f) {
+                    for (int c = 0; c < 3; c++) {
+                        group.normal[c] = group.sum[c] / length;
+                    }
+                }
+            }
+
+            const bool facingKnown = !groups.empty() && (fog.windowBias > 0.0f);
+            float *groupNormals[MaxWindowGroups][3] = {
+                { &rtParams.raysWindowGroup0X, &rtParams.raysWindowGroup0Y, &rtParams.raysWindowGroup0Z },
+                { &rtParams.raysWindowGroup1X, &rtParams.raysWindowGroup1Y, &rtParams.raysWindowGroup1Z },
+                { &rtParams.raysWindowGroup2X, &rtParams.raysWindowGroup2Y, &rtParams.raysWindowGroup2Z },
+                { &rtParams.raysWindowGroup3X, &rtParams.raysWindowGroup3Y, &rtParams.raysWindowGroup3Z },
+            };
+            rtParams.raysWindowGroups = facingKnown ? uint32_t(groups.size()) : 0u;
+            for (uint32_t g = 0; g < MaxWindowGroups; g++) {
+                for (int c = 0; c < 3; c++) {
+                    *groupNormals[g][c] = (facingKnown && (g < groups.size())) ? groups[g].normal[c] : 0.0f;
+                }
+            }
+
+            rtParams.raysWindowBias = facingKnown ? fog.windowBias : 0.0f;
+            if (rtScene.windowDraws == 0) {
+                rtParams.raysWindows = 0.0f;
+            }
+            rtResources->lastWindowDraws = rtScene.windowDraws;
+            const bool sameArea = (rtResources->lastFogMap == rtScene.areaMap) && (rtResources->lastFogRoom == rtScene.areaRoom);
+            rtParams.fogHistory = (active && rtResources->lastFogActive && sameArea) ? 1u : 0u;
+            rtResources->lastFogActive = active;
+            rtResources->lastFogMap = rtScene.areaMap;
+            rtResources->lastFogRoom = rtScene.areaRoom;
+            rtResources->lastFogHour = lightingSceneLight.clockHour;
+            rtResources->fogSettingSource = source;
+            rtResources->fogSettingScope = scope;
+        }
+
         // Jitter, display scale and history resets of the upscaler (after historyReset is known).
         rtResources->updateUpscalerFrame(frameParams.frameCount);
         
@@ -2667,7 +2888,9 @@ namespace RT64 {
                 RenderTextureBarrier(rtResources->momentsTexture[1].get(), RenderTextureLayout::GENERAL),
                 RenderTextureBarrier(rtResources->lightVarianceTexture[0].get(), RenderTextureLayout::GENERAL),
                 RenderTextureBarrier(rtResources->lightVarianceTexture[1].get(), RenderTextureLayout::GENERAL),
-                RenderTextureBarrier(rtResources->lightGuideTexture.get(), RenderTextureLayout::GENERAL)
+                RenderTextureBarrier(rtResources->lightGuideTexture.get(), RenderTextureLayout::GENERAL),
+                RenderTextureBarrier(rtResources->volumetricTexture[0].get(), RenderTextureLayout::GENERAL),
+                RenderTextureBarrier(rtResources->volumetricTexture[1].get(), RenderTextureLayout::GENERAL)
             };
 
             worker->commandList->barriers(RenderBarrierStage::COMPUTE, afterCreationBarriers, uint32_t(std::size(afterCreationBarriers)));
@@ -2684,7 +2907,9 @@ namespace RT64 {
             RenderTextureBarrier(rtResources->reactiveMaskTexture.get(), RenderTextureLayout::GENERAL),
             RenderTextureBarrier(rtResources->lockMaskTexture.get(), RenderTextureLayout::GENERAL),
             RenderTextureBarrier(rtResources->depthTexture[0].get(), RenderTextureLayout::GENERAL),
-            RenderTextureBarrier(rtResources->depthTexture[1].get(), RenderTextureLayout::GENERAL)
+            RenderTextureBarrier(rtResources->depthTexture[1].get(), RenderTextureLayout::GENERAL),
+            RenderTextureBarrier(rtResources->volumetricTexture[0].get(), RenderTextureLayout::GENERAL),
+            RenderTextureBarrier(rtResources->volumetricTexture[1].get(), RenderTextureLayout::GENERAL)
         };
 
         worker->commandList->barriers(RenderBarrierStage::COMPUTE, preDispatchBarriers, uint32_t(std::size(preDispatchBarriers)));
@@ -2910,7 +3135,9 @@ namespace RT64 {
             RenderTextureBarrier(rtResources->refractionTexture.get(), RenderTextureLayout::SHADER_READ),
             RenderTextureBarrier(rtResources->transparentTexture.get(), RenderTextureLayout::SHADER_READ),
             // ComposePS reads the ambient part of the light factor from the flow texture.
-            RenderTextureBarrier(rtResources->flowTexture.get(), RenderTextureLayout::SHADER_READ)
+            RenderTextureBarrier(rtResources->flowTexture.get(), RenderTextureLayout::SHADER_READ),
+            // ComposePS and PostProcessPS read the volumetric fog.
+            RenderTextureBarrier(rtResources->volumetricTexture[rtResources->swapBuffers ? 1 : 0].get(), RenderTextureLayout::SHADER_READ)
         };
 
         worker->commandList->barriers(RenderBarrierStage::GRAPHICS, afterDispatchBarriers, uint32_t(std::size(afterDispatchBarriers)));
@@ -3065,6 +3292,12 @@ namespace RT64 {
             worker->commandList->drawInstanced(3, 1, 0, 0);
         }
 
+        // The volumetric fog goes over the image last, after the draws rasterized on top of it when there are any.
+        rtResources->volumetricScissor = viewportScissorIntersection(rtScene.viewport, rtScene.scissor);
+        if (!rtScene.volumetricLater) {
+            submitVolumetric(worker, colorTarget);
+        }
+
         rtResources->writePassTimestamp(worker, RaytracingResources::PassTimestamp::Post);
         rtResources->endPassTiming();
 
@@ -3084,6 +3317,22 @@ namespace RT64 {
         }
 
         // Mark targets for resolve.
+        colorTarget->markForResolve();
+    }
+
+    void FramebufferRenderer::submitVolumetric(RenderWorker *worker, RenderTarget *colorTarget) {
+        if (!rtResources->lastFogActive || (colorTarget == nullptr) || (shaderLibrary->volumetric.pipeline == nullptr)) {
+            return;
+        }
+
+        worker->commandList->setFramebuffer(colorTarget->textureFramebuffer.get());
+        worker->commandList->setViewports(RenderViewport(0.0f, 0.0f, float(rtResources->displayWidth), float(rtResources->displayHeight)));
+        worker->commandList->setScissors(rtResources->volumetricScissor);
+        worker->commandList->setVertexBuffers(0, nullptr, 0, nullptr);
+        worker->commandList->setPipeline(shaderLibrary->volumetric.pipeline.get());
+        worker->commandList->setGraphicsPipelineLayout(shaderLibrary->volumetric.pipelineLayout.get());
+        worker->commandList->setGraphicsDescriptorSet(rtResources->postProcessSet->get(), 0);
+        worker->commandList->drawInstanced(3, 1, 0, 0);
         colorTarget->markForResolve();
     }
 #endif
@@ -3243,6 +3492,14 @@ namespace RT64 {
                 if (rasterScene.lightable && !rasterScene.rtLit) {
                     submitSceneLighting(worker, framebuffer, targetDrawCall.fbStorage, rasterScene, depthState);
                 }
+
+#           if RT_ENABLED
+                if (rasterScene.volumetricAfter) {
+                    submitVolumetric(worker, targetDrawCall.fbStorage->colorTarget);
+                    // It binds the color target alone: the next raster scene binds its depth again.
+                    depthState = true;
+                }
+#           endif
             }
         }
     }
@@ -3392,6 +3649,10 @@ namespace RT64 {
                 rtScene.drawsFlatShade = 0;
                 rtScene.drawsTexturePerspectiveOff = 0;
                 rtScene.drawsCulling = 0;
+                rtScene.gameFogValid = false;
+                rtScene.gameFogTriangles = 0;
+                rtScene.windowDraws = 0;
+                rtScene.windows.clear();
                 rtScene.incompatibleProjections = 0;
                 rtScene.skippedLayeredDraws = 0;
                 rtScene.billboardsCylindrical = 0;
@@ -3435,7 +3696,10 @@ namespace RT64 {
         // Submits the raster scene. In a lightable 3D view with path traced draws the order is: the raster scene
         // (sky, background and the path traced draws, which fill the depth buffer), the path traced pass that
         // replaces the pixels its rays hit, then the draws that are not path traced, rasterized on top.
+        // The volumetric fog goes over the 3D draws rasterized after (rasterSceneAfter), then the orthographic ones
+        // (rasterSceneAfterFlat) are drawn over it.
         RasterScene rasterSceneAfter;
+        RasterScene rasterSceneAfterFlat;
         auto flushRasterScene = [&]() {
 #       if RT_ENABLED
             const bool rtLit = rasterScene.lightable && !rasterScene.instanceIndices.empty() && !rtScene.instanceIndices.empty();
@@ -3443,11 +3707,15 @@ namespace RT64 {
             checkRasterScene(rasterScene);
             rasterScene.rtLit = false;
             if (rtLit) {
+                rtScene.volumetricLater = !rasterSceneAfter.instanceIndices.empty();
                 checkRtScene(rtScene);
             }
 
             rasterSceneAfter.lightable = false;
+            rasterSceneAfter.volumetricAfter = rtLit;
             checkRasterScene(rasterSceneAfter);
+            rasterSceneAfterFlat.lightable = false;
+            checkRasterScene(rasterSceneAfterFlat);
 #       else
             checkRasterScene(rasterScene);
 #       endif
@@ -3718,6 +3986,23 @@ namespace RT64 {
                             rtResources->addBottomLevelASMesh(asMesh);
                             rtInstanceAdded = true;
 
+                            if (interop::Blender::usesStandardFogCycle(otherMode) && (call.callDesc.triangleCount > rtScene.gameFogTriangles) &&
+                                (call.meshDesc.faceIndicesStart < drawData.faceIndices.size()) && (call.callDesc.callIndex < drawData.rdpParams.size()))
+                            {
+                                const uint32_t fogVertex = drawData.faceIndices[call.meshDesc.faceIndicesStart];
+                                const uint32_t fogIndex = (fogVertex < drawData.fogIndices.size()) ? uint32_t(drawData.fogIndices[fogVertex]) : 0u;
+                                if ((fogIndex > 0) && (fogIndex <= drawData.rspFog.size())) {
+                                    const interop::RDPParams &rdp = drawData.rdpParams[call.callDesc.callIndex];
+                                    rtScene.gameFogValid = true;
+                                    rtScene.gameFogTriangles = call.callDesc.triangleCount;
+                                    rtScene.gameFogColor[0] = rdp.fogColor.x;
+                                    rtScene.gameFogColor[1] = rdp.fogColor.y;
+                                    rtScene.gameFogColor[2] = rdp.fogColor.z;
+                                    rtScene.gameFogMul = drawData.rspFog[fogIndex - 1].mul;
+                                    rtScene.gameFogOffset = drawData.rspFog[fogIndex - 1].offset;
+                                }
+                            }
+
                             // Surface material by texture, from rt_materials.json or a guess. Textures not guessed yet
                             // this session are sampled on the GPU a few at a time.
                             if (flags.usesTexture0 && (call.callDesc.tileCount > 0)) {
@@ -3842,6 +4127,19 @@ namespace RT64 {
                             // line across its crossing partner. rt_materials.json class "foliage" turns it on for a
                             // texture; a user entry of another class (other than sprite or grass) turns it off.
                             rtMaterialsVector.back() &= ~RtMaterialClassBits;
+                            if (flags.usesTexture0 && (call.callDesc.tileCount > 0)) {
+                                RtMaterialEntry windowEntry;
+                                const uint64_t windowKey = drawData.callTiles[call.callDesc.tileIndex].tmemHashOrID;
+                                if (rtMaterialDatabase().find(windowKey, windowEntry) && windowEntry.user && (windowEntry.materialClass == RtMaterialClass::Window)) {
+                                    rtMaterialsVector.back() |= RtMaterialWindowFlag;
+                                    rtScene.windowDraws++;
+                                    RaytracingScene::WindowInfo windowInfo;
+                                    if ((rtScene.windows.size() < 64) && measureWindow(drawData, call.meshDesc.faceIndicesStart, call.callDesc.triangleCount, windowInfo)) {
+                                        rtScene.windows.push_back(windowInfo);
+                                    }
+                                }
+                            }
+
                             bool foliageListedOther = false;
                             if (alphaTested && !decalDraw) {
                                 const uint64_t foliageKey = (flags.usesTexture0 && (call.callDesc.tileCount > 0)) ? drawData.callTiles[call.callDesc.tileIndex].tmemHashOrID : 0;
@@ -4481,7 +4779,8 @@ namespace RT64 {
                     rasterScene.instanceIndices.push_back(instanceIndex);
                 }
                 else if (rasterScene.lightable && !rtScene.instanceIndices.empty()) {
-                    rasterSceneAfter.instanceIndices.push_back(instanceIndex);
+                    // Only the 3D view's draws go under the volumetric fog; orthographic ones (HUD) go over it.
+                    (perspProj ? rasterSceneAfter : rasterSceneAfterFlat).instanceIndices.push_back(instanceIndex);
                     rtScene.rasterAfterDraws++;
                     rtScene.decalsRasterAfter += (call.shaderDesc.otherMode.zMode() == ZMODE_DEC) ? 1 : 0;
                     const interop::OtherMode &otherMode = call.shaderDesc.otherMode;

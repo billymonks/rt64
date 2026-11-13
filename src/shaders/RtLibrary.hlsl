@@ -1682,8 +1682,9 @@ void PrimaryRayGen() {
         gNormalRoughness[pix] = float4(geometricNormal * 0.5 + 0.5, mul(RtParams.viewProj, float4(position, 1.0)).w);
         // The ambient part of the light factor, which ComposePS darkens with ambient occlusion.
         gFlow[pix] = float2(ambientBase(), 0.0);
-        // Fog color and amount of the surface's blender, applied after lighting in ComposePS.
-        gTransparent[pix] = kHybridLighting ? float4(0.0, 0.0, 0.0, 0.0) : float4(payload.fr, payload.fg, payload.fb, payload.fogFactor);
+        // Fog color and amount of the surface's blender, applied after lighting in ComposePS. The volumetric fog's room
+        // setting may thin it.
+        gTransparent[pix] = kHybridLighting ? float4(0.0, 0.0, 0.0, 0.0) : float4(payload.fr, payload.fg, payload.fb, payload.fogFactor * RtParams.fogGameScale);
         if (diagFrame()) {
             diagCount(kDiagSmoothNormalHits, dot(normal, geometricNormal) < 0.9999);
             diagCount(kDiagDegenerateHits, hitDegenerate(payload.hit));
@@ -1724,14 +1725,11 @@ bool primaryHit(uint2 pix, out float3 position, out float3 normal, out float3 ge
 
 // Finds this surface point in last frame's image: moves it back by its velocity, projects it with last frame's
 // view-projection, and accepts the history there when the depth and normal stored last frame agree.
-bool reprojectHistory(float3 position, float3 velocity, float3 geometricNormal, out int2 previousPixel) {
+// The pixel a world position was at in last frame's image, and its view depth then.
+bool previousPixelOf(float3 previousPosition, out int2 previousPixel, out float previousDepth) {
     previousPixel = int2(0, 0);
-    // The lighting changed at once (the sun switched off or on with the room): start over rather than fade.
-    if (RtParams.historyReset != 0) {
-        return false;
-    }
-
-    const float4 clip = mul(RtParams.prevViewProj, float4(position - velocity, 1.0));
+    const float4 clip = mul(RtParams.prevViewProj, float4(previousPosition, 1.0));
+    previousDepth = clip.w;
     if (clip.w <= 1e-4) {
         return false;
     }
@@ -1740,7 +1738,18 @@ bool reprojectHistory(float3 position, float3 velocity, float3 geometricNormal, 
     const float2 vp = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y / (2.0 * RtParams.nearDist));
     const float2 p = RtParams.viewport.xy + vp * RtParams.viewport.zw;
     previousPixel = int2(floor(p));
-    if (any(previousPixel < 0) || (previousPixel.x >= int(RtParams.resolution.x)) || (previousPixel.y >= int(RtParams.resolution.y))) {
+    return all(previousPixel >= 0) && (previousPixel.x < int(RtParams.resolution.x)) && (previousPixel.y < int(RtParams.resolution.y));
+}
+
+bool reprojectHistory(float3 position, float3 velocity, float3 geometricNormal, out int2 previousPixel) {
+    previousPixel = int2(0, 0);
+    // The lighting changed at once (the sun switched off or on with the room): start over rather than fade.
+    if (RtParams.historyReset != 0) {
+        return false;
+    }
+
+    float depth;
+    if (!previousPixelOf(position - velocity, previousPixel, depth)) {
         return false;
     }
 
@@ -1749,13 +1758,329 @@ bool reprojectHistory(float3 position, float3 velocity, float3 geometricNormal, 
         return false;
     }
 
-    const bool depthMatches = abs(previous.w - clip.w) < (clip.w * kTemporalDepthTolerance + 0.5);
+    const bool depthMatches = abs(previous.w - depth) < (depth * kTemporalDepthTolerance + 0.5);
     const bool normalMatches = dot(previous.xyz * 2.0 - 1.0, geometricNormal) > kTemporalNormalTolerance;
     return depthMatches && normalMatches;
 }
 
 float colorLuminance(float3 color) {
     return dot(color, float3(0.3, 0.59, 0.11));
+}
+
+// Volumetric fog (rt_lights.json room settings "fog"). It keeps the game's look where the air is evenly lit and only
+// adds what uneven light does: air in the sun's or moon's shadow darkens what is behind it, so the lit air between
+// shadows (past windmill blades, through canopies and windows) reads as shafts, and the sun (looking towards it) and
+// the point lights glow in it. The camera ray is marched up to RtParams.fogDistance (fading out over its second half,
+// so the distance and the sky are left alone) in RtParams.fogSteps segments that lengthen with distance, each lit at
+// one jittered point through one sun or moon shadow ray and one shadow ray towards the strongest point light. The
+// glow (rgb) and what the shadowed air leaves of the image (alpha) go to gVolumetric, blended with last frame's;
+// ComposePS blurs and applies it.
+static const uint kFogMaxSteps = 16;
+// Share of the sun's light its glow gets: the fog only glows where the phase is above isotropic (towards the sun).
+static const float kFogSunGlow = 0.2;
+// Share of the point lights' light their glow gets (a room's many lights would otherwise wash it out).
+static const float kFogLightGlow = 0.25;
+// Share of this frame's fog in the blend with history, and the largest change of its alpha history is kept over
+// (a larger one means another surface is seen there now).
+static const float kFogTemporalBlend = 0.15;
+static const float kFogHistoryTolerance = 0.2;
+// Per-step offsets of the light sampling noise (the R2 sequence).
+static const float2 kFogStepNoise = float2(0.754877666, 0.569840296);
+
+// Henyey-Greenstein phase, scaled so isotropic fog is 1. cosTheta is between the view ray and the direction to the light.
+float fogPhase(float cosTheta) {
+    const float g = RtParams.fogAnisotropy;
+    const float g2 = g * g;
+    return (1.0 - g2) / pow(max(1.0 + g2 - 2.0 * g * cosTheta, 1e-4), 1.5);
+}
+
+float fogDensityAt(float3 position) {
+    return RtParams.fogDensity * exp(-RtParams.fogHeightFalloff * max(position.y - RtParams.fogBaseHeight, 0.0));
+}
+
+// Light the fog at this point glows with along the view ray (before the fog's color), and how much of the sun's or
+// moon's light it misses (shadow, 0 to its brightness).
+float3 fogLightAt(float3 position, float3 direction, float2 noise, out float shadow) {
+    float3 light = 0.0;
+    shadow = 0.0;
+    if ((RtParams.emissiveLightStart > 0) && (RtParams.sunDisabled == 0) && ((RtParams.fogSunScatter > 0.0) || (RtParams.fogShadows > 0.0))) {
+        const PointLight sun = SceneLights[0];
+        const float3 toSun = sun.position - position;
+        const float distance = length(toSun);
+        if (distance > 1e-3) {
+            const float3 sunDirection = toSun / distance;
+            const float3 shadowDirection = sampleCone(sunDirection, kSunAngularRadius, noise);
+            const float visibility = 1.0 - traceShadow(position, shadowDirection, distance, -1.0);
+            const float glowPhase = max(fogPhase(dot(direction, sunDirection)) - 1.0, 0.0);
+            light += sun.diffuseColor * (RtParams.fogSunScatter * kFogSunGlow * glowPhase * visibility);
+            shadow = (1.0 - visibility) * saturate(colorLuminance(sun.diffuseColor));
+        }
+    }
+
+    if ((RtParams.emissiveLightCount > 0) && (RtParams.fogLightScatter > 0.0)) {
+        float3 shadowed = 0.0;
+        float3 unshadowed = 0.0;
+        float strongestLuminance = 0.0;
+        float3 strongestDirection = float3(0.0, 1.0, 0.0);
+        float strongestDistance = 0.0;
+        float strongestRadius = 0.0;
+        [loop]
+        for (uint i = 0; i < RtParams.emissiveLightCount; i++) {
+            const PointLight pointLight = SceneLights[RtParams.emissiveLightStart + i];
+            const float3 toLight = pointLight.position - position;
+            const float distance = length(toLight);
+            if ((distance >= pointLight.attenuationRadius) || (distance < 1e-3)) {
+                continue;
+            }
+
+            const float3 lightDirection = toLight / distance;
+            const float3 contribution = emissiveRadiance(pointLight) * emissiveAttenuation(distance, pointLight.attenuationRadius);
+            if ((pointLight.groupBits & kManualNoShadowFlag) != 0) {
+                unshadowed += contribution;
+                continue;
+            }
+
+            shadowed += contribution;
+            const float luminance = colorLuminance(contribution);
+            if (luminance > strongestLuminance) {
+                strongestLuminance = luminance;
+                strongestDirection = lightDirection;
+                strongestDistance = distance;
+                strongestRadius = pointLight.pointRadius;
+            }
+        }
+
+        // The other lights take the strongest one's visibility, as sampleEmissive's untraced lights take the average.
+        if (strongestLuminance > 1e-5) {
+            const float maxT = max(strongestDistance - max(strongestRadius, 0.5), 0.1);
+            shadowed *= 1.0 - traceShadow(position, strongestDirection, maxT, -1.0);
+        }
+
+        light += (shadowed + unshadowed) * (kEmissiveStrength * kFogLightGlow * RtParams.fogLightScatter);
+    }
+
+    return light;
+}
+
+float4 marchFog(uint2 pix, float3 origin, float3 direction, float rayLength) {
+    const uint steps = clamp(RtParams.fogSteps, 1u, kFogMaxSteps);
+    const float2 offsetNoise = pixelNoise(pix, 6, 0);
+    const float2 lightNoise = pixelNoise(pix, 7, 0);
+    const float3 fogColor = float3(RtParams.fogColorR, RtParams.fogColorG, RtParams.fogColorB);
+    const float range = max(RtParams.fogDistance, 1.0);
+    float3 glow = 0.0;
+    float shadowDepth = 0.0;
+    float transmittance = 1.0;
+    float startT = 0.0;
+    [loop]
+    for (uint i = 0; (i < steps) && (startT < rayLength); i++) {
+        // Segments grow with the square of the distance, so fog near the camera (where shafts are sharpest) is sampled
+        // most finely. They are the same for every ray, so a surface and the sky beside it get the same fog up to the
+        // surface.
+        const float u = float(i + 1) / float(steps);
+        const float endT = min(range * u * u, rayLength);
+        const float t = lerp(startT, endT, offsetNoise.x);
+        const float3 position = origin + direction * t;
+        const float fade = 1.0 - smoothstep(0.5 * range, range, t);
+        const float opticalDepth = fogDensityAt(position) * fade * (endT - startT);
+        if (opticalDepth > 1e-5) {
+            float shadow;
+            const float3 light = RtParams.fogAmbient + fogLightAt(position, direction, frac(lightNoise + kFogStepNoise * float(i)), shadow);
+            glow += fogColor * light * (transmittance * (1.0 - exp(-opticalDepth)));
+            shadowDepth += opticalDepth * shadow * transmittance;
+            transmittance *= exp(-opticalDepth);
+        }
+
+        startT = endT;
+    }
+
+    return float4(glow, exp(-shadowDepth * RtParams.fogShadows));
+}
+
+// God rays (Graphics menu "God Rays", room settings "fog" "rays"). Screen space: each pixel gathers the light of the
+// sources on the line from it towards where the light comes from on screen (the vanishing point of its direction, or
+// away from the opposite one when the light is behind the camera), fading along the way, so light streams from the
+// sources past whatever stands in front of them. The sources are the sky (pixels the camera ray missed) around the sun
+// or moon, brightest towards it, and window textures (rt_materials.json class "window") in their own color, lit from
+// the room's ray direction where the sun or moon is off. They run after PrimaryRayGen, so every pixel's hit is known.
+static const uint kMaterialWindowFlag = 1u << 24;
+static const uint kGodRaySamples = 32;
+// What each further sample along the line counts, relative to the one before.
+static const float kGodRayDecay = 0.95;
+// How tightly the sky's brightness as a source gathers around the sun or moon (a power of the cosine).
+static const float kGodRaySkyFocus = 12.0;
+
+// The screen position (ray tracing pixels) of a clip space position; w may be negative.
+float2 clipToPixel(float4 clip) {
+    const float2 ndc = clip.xy / clip.w;
+    const float2 vp = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y / (2.0 * RtParams.nearDist));
+    return RtParams.viewport.xy + vp * RtParams.viewport.zw;
+}
+
+float3 windowGroupNormal(uint group) {
+    if (group == 0) return float3(RtParams.raysWindowGroup0X, RtParams.raysWindowGroup0Y, RtParams.raysWindowGroup0Z);
+    if (group == 1) return float3(RtParams.raysWindowGroup1X, RtParams.raysWindowGroup1Y, RtParams.raysWindowGroup1Z);
+    if (group == 2) return float3(RtParams.raysWindowGroup2X, RtParams.raysWindowGroup2Y, RtParams.raysWindowGroup2Z);
+    return float3(RtParams.raysWindowGroup3X, RtParams.raysWindowGroup3Y, RtParams.raysWindowGroup3Z);
+}
+
+// The facing group of window pixel p: the group closest to its normal turned away from the camera.
+uint windowGroupAt(int2 p) {
+    const float3 normal = gShadingNormal[p].xyz;
+    const float3 outward = (dot(normal, gViewDirection[p].xyz) > 0.0) ? -normal : normal;
+    uint best = 0;
+    float bestDot = -2.0;
+    for (uint g = 0; g < RtParams.raysWindowGroups; g++) {
+        const float d = dot(outward, windowGroupNormal(g));
+        if (d > bestDot) {
+            bestDot = d;
+            best = g;
+        }
+    }
+
+    return best;
+}
+
+// The light pixel p gives the god rays: the sky around the sun or moon (sky pass), or a window's color (window pass;
+// only the windows of facing group windowGroup, any when it's negative).
+float3 godRaySource(int2 p, float3 toLight, bool skyPass, float3 skyColor, int windowGroup) {
+    const int renderIndex = gInstanceId[p];
+    if (renderIndex < 0) {
+        float3 origin, direction;
+        if (!skyPass || !cameraRay(uint2(p), origin, direction)) {
+            return 0.0;
+        }
+
+        return skyColor * pow(saturate(dot(direction, toLight)), kGodRaySkyFocus);
+    }
+
+    if (!skyPass && ((gRtMaterials[uint(renderIndex)] & kMaterialWindowFlag) != 0) &&
+        ((windowGroup < 0) || (windowGroupAt(p) == uint(windowGroup))))
+    {
+        return gDiffuse[p].rgb * RtParams.raysWindows;
+    }
+
+    return 0.0;
+}
+
+// The light gathered along the line from pix towards toLight's place on screen, in samples steps (scaled to what
+// kGodRaySamples steps would gather).
+float3 gatherGodRays(uint2 pix, float3 toLight, bool skyPass, float3 skyColor, uint samples, int windowGroup) {
+    const float4 clip = mul(RtParams.viewProj, float4(toLight, 0.0));
+    if (abs(clip.w) < 1e-6) {
+        return 0.0;
+    }
+
+    const float2 here = float2(pix) + 0.5;
+    const float2 along = (clipToPixel(clip) - here) * sign(clip.w);
+    const float distance = length(along);
+    const float reach = RtParams.raysLength * max(RtParams.viewport.z, RtParams.viewport.w);
+    const float lineLength = (clip.w > 0.0) ? min(distance, reach) : reach;
+    if ((distance < 1e-3) || (lineLength < 1.0)) {
+        return 0.0;
+    }
+
+    const float stride = float(kGodRaySamples) / float(samples);
+    const float2 step = along * (lineLength / (distance * float(samples)));
+    const float decay = pow(kGodRayDecay, stride);
+    const float jitter = pixelNoise(pix, 8, 0).x;
+    float3 sum = 0.0;
+    float weight = 1.0;
+    [loop]
+    for (uint i = 0; i < samples; i++) {
+        const float2 p = here + step * (float(i) + jitter);
+        if (any(p < 0.0) || !pixelInViewport(uint2(p)) || !pixelInBounds(uint2(p))) {
+            break;
+        }
+
+        sum += godRaySource(int2(p), toLight, skyPass, skyColor, windowGroup) * weight;
+        weight *= decay;
+    }
+
+    return sum * stride;
+}
+
+float3 godRays(uint2 pix) {
+    float3 origin, direction;
+    if ((RtParams.raysStrength <= 0.0) || !cameraRay(pix, origin, direction)) {
+        return 0.0;
+    }
+
+    // The sky's rays come from the sun or moon; the windows' from it too, or from the room's ray direction where it's
+    // off, turned towards the way the windows face out (RtParams.raysWindowBias) so they shine in through them: each
+    // facing group (a wall's windows) its own way.
+    float3 toLight = float3(RtParams.raysDirX, RtParams.raysDirY, RtParams.raysDirZ);
+    float3 sum = 0.0;
+    if ((RtParams.raysFromSun != 0) && (RtParams.emissiveLightStart > 0)) {
+        const PointLight sun = SceneLights[0];
+        const float3 toSun = sun.position - origin;
+        if (dot(toSun, toSun) > 1e-6) {
+            toLight = normalize(toSun);
+        }
+
+        sum += gatherGodRays(pix, toLight, true, sun.diffuseColor, kGodRaySamples, -1);
+    }
+
+    if (RtParams.raysWindows > 0.0) {
+        const uint groups = min(RtParams.raysWindowGroups, 4u);
+        if (groups == 0) {
+            sum += gatherGodRays(pix, toLight, false, 0.0, kGodRaySamples, -1);
+        }
+        else {
+            // Fewer steps each with more groups, so 4 walls of windows cost twice one.
+            const uint samples = max(kGodRaySamples / groups, 16u);
+            for (uint g = 0; g < groups; g++) {
+                const float3 bent = lerp(toLight, windowGroupNormal(g), RtParams.raysWindowBias);
+                const float3 windowLight = (dot(bent, bent) > 1e-6) ? normalize(bent) : toLight;
+                sum += gatherGodRays(pix, windowLight, false, 0.0, samples, int(g));
+            }
+        }
+    }
+
+    const float3 tint = float3(RtParams.raysColorR, RtParams.raysColorG, RtParams.raysColorB);
+    return sum * tint * (RtParams.raysStrength / float(kGodRaySamples));
+}
+
+// Off (and outside the viewport) the fog scatters nothing and leaves the whole surface: (0, 0, 0, 1). The god rays
+// add to its glow.
+void writeVolumetric(uint2 pix) {
+    float4 fog = float4(0.0, 0.0, 0.0, 1.0);
+    float3 origin, direction;
+    if (((RtParams.fogDensity > 0.0) || (RtParams.raysStrength > 0.0)) && pixelInViewport(pix) && cameraRay(pix, origin, direction)) {
+        // Rays that miss the scene march the fog's whole distance, over the sky.
+        const bool surface = gDiffuse[pix].a > EPSILON;
+        const float rayLength = surface ? min(gDepth[pix], RtParams.fogDistance) : RtParams.fogDistance;
+        if (RtParams.fogDensity > 0.0) {
+            fog = marchFog(pix, origin, direction, rayLength);
+        }
+
+        fog.rgb += godRays(pix);
+
+        // Last frame's fog where the same surface, or the same point of the sky, was seen.
+        int2 previousPixel = int2(0, 0);
+        bool historyValid = false;
+        if ((RtParams.fogHistory != 0) && (RtParams.historyReset == 0)) {
+            if (surface) {
+                float3 position, normal, geometricNormal, velocity;
+                float hitT;
+                bool twoSided;
+                historyValid = primaryHit(pix, position, normal, geometricNormal, velocity, hitT, twoSided) && reprojectHistory(position, velocity, geometricNormal, previousPixel);
+            }
+            else {
+                float depth;
+                historyValid = previousPixelOf(origin + direction * rayLength, previousPixel, depth);
+            }
+        }
+
+        if (historyValid) {
+            const float4 history = gPrevVolumetric[previousPixel];
+            if (all(isfinite(history)) && (abs(history.a - fog.a) < kFogHistoryTolerance)) {
+                fog = lerp(history, fog, kFogTemporalBlend);
+            }
+        }
+    }
+
+    gVolumetric[pix] = fog;
 }
 
 // This frame's direct light, the average of RtParams.lightSamples independent samples, goes to gFilteredDirectLight
@@ -1766,6 +2091,8 @@ void DirectRayGen() {
     if (!pixelInBounds(pix)) {
         return;
     }
+
+    writeVolumetric(pix);
 
     float3 position, normal, geometricNormal, velocity;
     float hitT;

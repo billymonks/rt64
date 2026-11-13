@@ -59,6 +59,7 @@ namespace RT64 {
         ShaderRecord videoInterfaceLinear;
         ShaderRecord videoInterfaceNearest;
         ShaderRecord videoInterfacePixel;
+        ShaderRecord volumetric;
         std::unique_ptr<RenderShader> shadowCutoutVertexShader;
         std::unique_ptr<RenderShader> shadowCutoutPixelShader;
 

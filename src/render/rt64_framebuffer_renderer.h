@@ -42,6 +42,8 @@ namespace RT64 {
         bool lightable = false;
         // The ray traced scene that follows lights this scene, so the shadow map pass is skipped.
         bool rtLit = false;
+        // The draws rasterized after a path traced scene: the volumetric fog goes over the image after them.
+        bool volumetricAfter = false;
         float nativeWidth = 0.0f;
         float nativeHeight = 0.0f;
         float viewportX = 0.0f;
@@ -230,6 +232,7 @@ namespace RT64 {
         void resetRaytracing(RaytracingShaderCache *rtShaderCache, const RenderTexture *blueNoiseTexture);
         void updateRaytracingScene(RenderWorker *worker, const RaytracingScene &rtScene);
         void submitRaytracingScene(RenderWorker *worker, RenderTarget *colorTarget, const RaytracingScene &rtScene);
+        void submitVolumetric(RenderWorker *worker, RenderTarget *colorTarget);
         void setRaytracingConfig(const RaytracingConfiguration &rtConfig, bool resolutionChanged);
 #   endif
     };
